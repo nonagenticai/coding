@@ -1,0 +1,795 @@
+//! Domain types shared by the HTTP API, the store and the worker.
+//!
+//! Timestamps are RFC 3339 UTC strings produced by Postgres (`to_char`), so the API needs no
+//! date crate and `--locked` stays valid.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use utoipa::ToSchema;
+
+/// What a job does. Closed set: the worker maps each kind to an allowlisted runner image and
+/// command plan, so a request can never name an image or an arbitrary binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    /// Run the repository's test suite and return normalized results.
+    Test,
+    /// Run the repository's linters/formatters and return their parsed output.
+    Lint,
+    /// Compile/build the repository.
+    Build,
+    /// The pre-commit gate: format, clippy and the test suite, in one Pod and one clone.
+    Check,
+    /// Static analysis families (structure, complexity, dependencies, quality, hunts).
+    Analyze,
+    /// Dependency/CVE and secret scanning.
+    Scan,
+    /// A GitHub action: push, create a PR, mark ready, comment.
+    GithubOp,
+    /// Bulk dependency upgrade (replaces coding-repo-jobs).
+    DependencyUpgrade,
+    /// PyPI package -> crate mapping for the rewrite capability.
+    CrateMap,
+    /// Rewrite parity: OpenAPI contract diff.
+    ParityOpenapi,
+    /// Rewrite parity: database schema diff.
+    ParitySchema,
+    /// Rewrite parity: recorded request/response behaviour diff.
+    ParityBehaviour,
+    /// Rewrite parity: latency/throughput comparison.
+    ParityPerf,
+}
+
+impl JobKind {
+    /// Stable wire/DB spelling. Kept explicit so the DB and the API cannot drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Test => "test",
+            Self::Lint => "lint",
+            Self::Build => "build",
+            Self::Check => "check",
+            Self::Analyze => "analyze",
+            Self::Scan => "scan",
+            Self::GithubOp => "github_op",
+            Self::DependencyUpgrade => "dependency_upgrade",
+            Self::CrateMap => "crate_map",
+            Self::ParityOpenapi => "parity_openapi",
+            Self::ParitySchema => "parity_schema",
+            Self::ParityBehaviour => "parity_behaviour",
+            Self::ParityPerf => "parity_perf",
+        }
+    }
+
+    /// Parse the DB/wire spelling. `None` means a row written by a newer build, not a request
+    /// error, so the caller renders it as `503` rather than blaming the client.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "test" => Self::Test,
+            "lint" => Self::Lint,
+            "build" => Self::Build,
+            "check" => Self::Check,
+            "analyze" => Self::Analyze,
+            "scan" => Self::Scan,
+            "github_op" => Self::GithubOp,
+            "dependency_upgrade" => Self::DependencyUpgrade,
+            "crate_map" => Self::CrateMap,
+            "parity_openapi" => Self::ParityOpenapi,
+            "parity_schema" => Self::ParitySchema,
+            "parity_behaviour" => Self::ParityBehaviour,
+            "parity_perf" => Self::ParityPerf,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+impl JobStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "queued" => Self::Queued,
+            "running" => Self::Running,
+            "succeeded" => Self::Succeeded,
+            "failed" => Self::Failed,
+            "cancelled" => Self::Cancelled,
+            _ => return None,
+        })
+    }
+}
+
+/// Maximum total size of an inline source, in bytes of file text. The whole job spec rides in one
+/// Pod env var, so the files must leave room for the envelope.
+const MAX_INLINE_BYTES: usize = 49_152;
+
+/// The typed, closed input a job carries. `source` says where the code comes from; a kind that
+/// needs code must supply it. Unknown fields are a parse error, so a caller cannot smuggle a
+/// field this contract does not name into the stored jsonb.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct JobInput {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<Source>,
+}
+
+/// Where the code under test comes from. Tagged by `kind`, so a typo is a parse error rather than
+/// a source the runner silently cannot materialise.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Source {
+    /// Files carried inline with the request; written to the work dir before the plan runs.
+    Inline { files: Vec<InlineFile> },
+    /// A bounded clone of a git repository at one ref.
+    ///
+    /// `token` is set by the worker only, and only for a github.com URL: a short-lived GitHub App
+    /// installation token that lets the clone reach a private repository. A request that sets it
+    /// is refused, so a caller cannot make the Pod present a credential of its choosing.
+    Git {
+        url: String,
+        #[serde(rename = "ref", default = "default_ref")]
+        git_ref: String,
+        #[serde(default = "default_depth")]
+        depth: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    /// An archive the client uploaded to `POST /api/sources`.
+    ///
+    /// A request names only `id`. `url`, `token` and `sha256` are filled in by the worker when it
+    /// hands the spec to the Pod: the fetch address and the capability token are the server's to
+    /// decide, so a caller cannot point a runner at a URL of its choosing.
+    Upload {
+        id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sha256: Option<String>,
+    },
+}
+
+/// One file of an inline source. `path` is relative and checked by [`JobInput::validate`].
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InlineFile {
+    pub path: String,
+    pub text: String,
+}
+
+fn default_depth() -> u32 {
+    1
+}
+
+/// Why [`JobInput::validate`] rejected a request. The route renders this as the service's one
+/// error envelope; `code` is always `"invalid_job_input"`, so a client branches on one value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl InputError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            code: "invalid_job_input",
+            message: message.into(),
+        }
+    }
+}
+
+/// Kinds that cannot run without code. One place inside this module, so the requirement and the
+/// error message cannot drift apart.
+fn needs_source(kind: JobKind) -> bool {
+    matches!(
+        kind,
+        JobKind::Test | JobKind::Lint | JobKind::Build | JobKind::Check
+    )
+}
+
+impl JobInput {
+    /// Enforce the input contract for `kind`: a source is required for the kinds that run code,
+    /// and any source that is present must be materialisable.
+    pub fn validate(&self, kind: JobKind) -> Result<(), InputError> {
+        match &self.source {
+            Some(source) => validate_source(source),
+            None if needs_source(kind) => Err(InputError::new(format!(
+                "kind {} requires input.source",
+                kind.as_str()
+            ))),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The source rules. The runner enforces the same rules again on the spec it is handed, so keep
+/// the two in step: whatever this function admits must be something the runner can materialise.
+fn validate_source(source: &Source) -> Result<(), InputError> {
+    match source {
+        Source::Inline { files } => {
+            if files.is_empty() {
+                return Err(InputError::new(
+                    "inline source must contain at least one file",
+                ));
+            }
+            let mut total = 0usize;
+            let mut seen = std::collections::HashSet::with_capacity(files.len());
+            for file in files {
+                total = total.saturating_add(file.text.len());
+                validate_path(&file.path)?;
+                if !seen.insert(file.path.as_str()) {
+                    return Err(InputError::new(format!(
+                        "inline source repeats path {:?}",
+                        file.path
+                    )));
+                }
+            }
+            if total > MAX_INLINE_BYTES {
+                return Err(InputError::new(format!(
+                    "inline source is {total} bytes, over the {MAX_INLINE_BYTES}-byte cap"
+                )));
+            }
+            Ok(())
+        }
+        Source::Git {
+            url,
+            git_ref,
+            depth,
+            token,
+        } => {
+            if token.is_some() {
+                return Err(InputError::new(
+                    "a git source's token is minted by the server, never supplied by a request",
+                ));
+            }
+            if url.is_empty() || url.len() > 2048 {
+                return Err(InputError::new("git url must be 1..=2048 characters"));
+            }
+            if url.starts_with('-') {
+                return Err(InputError::new("git url must not start with '-'"));
+            }
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                return Err(InputError::new(
+                    "git url must start with https:// or http://",
+                ));
+            }
+            if url
+                .chars()
+                .any(|c| c.is_ascii_whitespace() || c.is_ascii_control())
+            {
+                return Err(InputError::new(
+                    "git url must not contain whitespace or control characters",
+                ));
+            }
+            if git_ref.is_empty() || git_ref.len() > 200 {
+                return Err(InputError::new("git ref must be 1..=200 characters"));
+            }
+            if git_ref.starts_with('-') || git_ref.starts_with('/') {
+                return Err(InputError::new("git ref must not start with '-' or '/'"));
+            }
+            if git_ref.contains("..") {
+                return Err(InputError::new("git ref must not contain '..'"));
+            }
+            if !git_ref
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+            {
+                return Err(InputError::new(
+                    "git ref has characters outside [A-Za-z0-9._/-]",
+                ));
+            }
+            if !(1..=1000).contains(depth) {
+                return Err(InputError::new("git depth must be between 1 and 1000"));
+            }
+            Ok(())
+        }
+        Source::Upload {
+            id,
+            url,
+            token,
+            sha256,
+        } => {
+            validate_uuid(id, "source id")?;
+            if url.is_some() || token.is_some() || sha256.is_some() {
+                return Err(InputError::new(
+                    "an upload source is created by the server: a request may set only its id",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// A canonical UUID, as Postgres renders one. The id is cast in SQL, so a malformed one would
+/// otherwise surface as a database error rather than a 400 that names the field.
+pub fn validate_uuid(value: &str, field: &str) -> Result<(), InputError> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return Err(InputError::new(format!(
+            "{field} must be a 36-character UUID"
+        )));
+    }
+    for (index, byte) in bytes.iter().enumerate() {
+        let ok = match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        };
+        if !ok {
+            return Err(InputError::new(format!("{field} is not a UUID")));
+        }
+    }
+    Ok(())
+}
+
+/// A relative path inside the source tree, with no way out of it.
+fn validate_path(path: &str) -> Result<(), InputError> {
+    if path.is_empty() || path.len() > 512 {
+        return Err(InputError::new("file path must be 1..=512 characters"));
+    }
+    if path.contains('\0') {
+        return Err(InputError::new(format!("file path {path:?} contains NUL")));
+    }
+    if path.starts_with('/') || path.contains('\\') || path.ends_with('/') {
+        return Err(InputError::new(format!(
+            "file path {path:?} is not a relative file path"
+        )));
+    }
+    for component in path.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            return Err(InputError::new(format!(
+                "file path {path:?} escapes the source tree"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The one error shape. `retryable` tells a caller whether re-submitting can help.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct JobError {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+    pub retryable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Timings {
+    pub queued_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+}
+
+/// A job as returned by every read endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct Job {
+    pub id: String,
+    pub kind: JobKind,
+    pub status: JobStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<JobError>,
+    pub timings: Timings,
+}
+
+/// Where the work happens. Either reference an existing workspace (`workspace_id`) or ask for a
+/// one-shot one by naming the repository.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WorkspaceSpec {
+    pub repo_url: String,
+    #[serde(default = "default_ref")]
+    pub git_ref: String,
+    #[serde(default)]
+    pub toolchain: Option<String>,
+}
+
+fn default_ref() -> String {
+    "main".to_owned()
+}
+
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct CreateJobRequest {
+    pub kind: JobKind,
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<WorkspaceSpec>,
+    #[serde(default)]
+    pub input: JobInput,
+    /// Caller-supplied dedupe key. Unique per tenant: a replay returns the original job.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u32,
+}
+
+fn default_timeout() -> u32 {
+    900
+}
+
+/// The `POST /api/jobs/status` body. A POST because conveyor's action engine cannot template a
+/// path and a GET carries no body.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct JobStatusRequest {
+    pub id: String,
+}
+
+/// First HTTP-level failure code: the request never reached the store.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorBody {
+    pub error: ErrorDetail,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ErrorDetail {
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<Value>,
+    pub retryable: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_wire_names_are_stable() {
+        assert_eq!(JobKind::GithubOp.as_str(), "github_op");
+        assert_eq!(JobKind::ParityOpenapi.as_str(), "parity_openapi");
+        assert_eq!(
+            serde_json::to_string(&JobKind::DependencyUpgrade).unwrap(),
+            "\"dependency_upgrade\""
+        );
+    }
+
+    #[test]
+    fn terminal_states_are_the_three_outcomes() {
+        assert!(JobStatus::Succeeded.is_terminal());
+        assert!(JobStatus::Failed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+        assert!(!JobStatus::Queued.is_terminal());
+    }
+
+    fn inline(files: &[(&str, &str)]) -> JobInput {
+        JobInput {
+            source: Some(Source::Inline {
+                files: files
+                    .iter()
+                    .map(|(path, text)| InlineFile {
+                        path: (*path).to_owned(),
+                        text: (*text).to_owned(),
+                    })
+                    .collect(),
+            }),
+        }
+    }
+
+    fn git(url: &str, git_ref: &str) -> JobInput {
+        JobInput {
+            source: Some(Source::Git {
+                url: url.to_owned(),
+                git_ref: git_ref.to_owned(),
+                depth: 1,
+                token: None,
+            }),
+        }
+    }
+
+    fn reject(input: &JobInput, kind: JobKind) -> InputError {
+        input
+            .validate(kind)
+            .expect_err(&format!("{input:?} must be rejected for {kind:?}"))
+    }
+
+    #[test]
+    fn valid_inline_source_is_accepted() {
+        for kind in [JobKind::Test, JobKind::Lint, JobKind::Build, JobKind::Check] {
+            assert!(
+                inline(&[("src/main.rs", "fn main() {}")])
+                    .validate(kind)
+                    .is_ok(),
+                "{kind:?}"
+            );
+        }
+        assert!(
+            inline(&[("Cargo.toml", ""), ("src/lib.rs", "pub fn f() {}")])
+                .validate(JobKind::Test)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_lint_build_require_a_source() {
+        for kind in [JobKind::Test, JobKind::Lint, JobKind::Build, JobKind::Check] {
+            let error = reject(&JobInput::default(), kind);
+            assert_eq!(error.code, "invalid_job_input");
+            assert_eq!(
+                error.message,
+                format!("kind {} requires input.source", kind.as_str())
+            );
+        }
+        // Every other kind runs without code, so a source is optional there.
+        for kind in [
+            JobKind::Analyze,
+            JobKind::Scan,
+            JobKind::GithubOp,
+            JobKind::DependencyUpgrade,
+            JobKind::CrateMap,
+            JobKind::ParityOpenapi,
+            JobKind::ParitySchema,
+            JobKind::ParityBehaviour,
+            JobKind::ParityPerf,
+        ] {
+            assert!(JobInput::default().validate(kind).is_ok(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn empty_inline_source_is_rejected() {
+        let error = reject(&inline(&[]), JobKind::Test);
+        assert_eq!(error.code, "invalid_job_input");
+        assert!(
+            error.message.contains("at least one file"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn inline_cap_is_the_sum_of_the_file_text() {
+        let cap = MAX_INLINE_BYTES;
+        assert!(
+            inline(&[("a.txt", "x".repeat(cap).as_str())])
+                .validate(JobKind::Test)
+                .is_ok(),
+            "exactly the cap is allowed"
+        );
+        let error = reject(
+            &inline(&[("a.txt", "x".repeat(cap + 1).as_str())]),
+            JobKind::Test,
+        );
+        assert_eq!(error.code, "invalid_job_input");
+        assert_eq!(
+            error.message,
+            format!(
+                "inline source is {} bytes, over the {cap}-byte cap",
+                cap + 1
+            )
+        );
+
+        // The cap is the sum across files, not a per-file allowance.
+        let half = "x".repeat(cap / 2 + 1);
+        let error = reject(
+            &inline(&[("a.txt", half.as_str()), ("b.txt", half.as_str())]),
+            JobKind::Test,
+        );
+        assert_eq!(error.code, "invalid_job_input");
+        assert_eq!(
+            error.message,
+            format!(
+                "inline source is {} bytes, over the {cap}-byte cap",
+                2 * (cap / 2 + 1)
+            )
+        );
+    }
+
+    #[test]
+    fn inline_paths_cannot_escape_the_source_tree() {
+        for bad in [
+            "../etc/passwd",
+            "a/../b",
+            "/etc/passwd",
+            "a//b",
+            "a/",
+            "a\\b",
+            ".",
+            "..",
+            "",
+        ] {
+            let error = reject(&inline(&[(bad, "x")]), JobKind::Test);
+            assert_eq!(error.code, "invalid_job_input", "{bad:?}");
+        }
+        assert!(
+            inline(&[("src/deep/mod.rs", "x"), ("Cargo.toml", "x")])
+                .validate(JobKind::Test)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn duplicate_inline_paths_are_rejected() {
+        let error = reject(
+            &inline(&[("Cargo.toml", "a"), ("Cargo.toml", "b")]),
+            JobKind::Test,
+        );
+        assert_eq!(error.code, "invalid_job_input");
+        assert!(error.message.contains("repeats path"), "{}", error.message);
+    }
+
+    #[test]
+    fn valid_git_source_is_accepted() {
+        assert!(
+            git("https://github.com/nonagenticai/coding.git", "main")
+                .validate(JobKind::Build)
+                .is_ok()
+        );
+        assert!(
+            git("http://git.example.com/o/r", "feature/x-1.2")
+                .validate(JobKind::Test)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn git_url_cannot_be_argv() {
+        for bad in [
+            "-x",
+            "--upload-pack=x",
+            "git://host/repo",
+            "https://host/repo with space",
+            "",
+        ] {
+            let error = reject(&git(bad, "main"), JobKind::Test);
+            assert_eq!(error.code, "invalid_job_input", "url {bad:?}");
+        }
+    }
+
+    #[test]
+    fn git_ref_cannot_be_argv_or_escape() {
+        for bad in [
+            "--",
+            "--upload-pack=x",
+            "/main",
+            "a..b",
+            "main~1",
+            "main^",
+            "main space",
+        ] {
+            let error = reject(&git("https://host/repo", bad), JobKind::Test);
+            assert_eq!(error.code, "invalid_job_input", "ref {bad:?}");
+        }
+        let error = reject(&git("https://host/repo", &"r".repeat(201)), JobKind::Test);
+        assert_eq!(error.code, "invalid_job_input");
+    }
+
+    #[test]
+    fn git_depth_is_bounded() {
+        for depth in [0u32, 1001] {
+            let input = JobInput {
+                source: Some(Source::Git {
+                    url: "https://host/repo".to_owned(),
+                    git_ref: "main".to_owned(),
+                    depth,
+                    token: None,
+                }),
+            };
+            let error = reject(&input, JobKind::Test);
+            assert_eq!(error.code, "invalid_job_input");
+            assert!(error.message.contains("depth"), "{}", error.message);
+        }
+    }
+
+    fn upload(id: &str) -> JobInput {
+        JobInput {
+            source: Some(Source::Upload {
+                id: id.to_owned(),
+                url: None,
+                token: None,
+                sha256: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn an_upload_source_names_only_its_id() {
+        assert!(
+            upload("6f1a1f6a-1d3a-4f2c-9a1e-2f4a1b7c8d90")
+                .validate(JobKind::Check)
+                .is_ok()
+        );
+        // The fetch address, the token and the hash are the server's to decide.
+        let mut with_url = upload("6f1a1f6a-1d3a-4f2c-9a1e-2f4a1b7c8d90");
+        if let Some(Source::Upload { url, .. }) = with_url.source.as_mut() {
+            *url = Some("http://elsewhere/blob".to_owned());
+        }
+        let error = reject(&with_url, JobKind::Check);
+        assert!(error.message.contains("created by the server"), "{error:?}");
+        // And the id must be one Postgres can cast.
+        for bad in [
+            "",
+            "nope",
+            "6f1a1f6a1d3a4f2c9a1e2f4a1b7c8d90",
+            "zz1a1f6a-1d3a-4f2c-9a1e-2f4a1b7c8d90",
+        ] {
+            let error = reject(&upload(bad), JobKind::Check);
+            assert!(error.message.contains("source id"), "{bad:?}: {error:?}");
+        }
+    }
+
+    #[test]
+    fn a_client_cannot_supply_a_git_token() {
+        let input = JobInput {
+            source: Some(Source::Git {
+                url: "https://github.com/o/r".to_owned(),
+                git_ref: "main".to_owned(),
+                depth: 1,
+                token: Some("ghs_supplied".to_owned()),
+            }),
+        };
+        let error = reject(&input, JobKind::Test);
+        assert!(error.message.contains("minted by the server"), "{error:?}");
+        // And it never serialises into a stored request when absent.
+        let value = serde_json::to_value(git("https://host/repo", "main")).unwrap();
+        assert!(value["source"].get("token").is_none(), "{value}");
+    }
+
+    #[test]
+    fn job_input_rejects_unknown_fields() {
+        let raw = r#"{"source":{"kind":"inline","files":[{"path":"a.txt","text":""}]},"bogus":1}"#;
+        assert!(serde_json::from_str::<JobInput>(raw).is_err());
+    }
+
+    #[test]
+    fn job_input_serde_defaults_source_and_git_fields() {
+        assert!(JobInput::default().source.is_none());
+        assert!(
+            serde_json::from_str::<JobInput>("{}")
+                .expect("an empty object is the default input")
+                .source
+                .is_none()
+        );
+        let input: JobInput =
+            serde_json::from_str(r#"{"source":{"kind":"git","url":"https://host/repo"}}"#)
+                .expect("git source with defaults");
+        match input.source {
+            Some(Source::Git { git_ref, depth, .. }) => {
+                assert_eq!(git_ref, "main");
+                assert_eq!(depth, 1);
+            }
+            other => panic!("expected a git source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_wire_shape_is_tagged_and_stable() {
+        let value = serde_json::to_value(git("https://host/repo", "main")).unwrap();
+        assert_eq!(value["source"]["kind"], "git");
+        assert_eq!(value["source"]["url"], "https://host/repo");
+        assert_eq!(value["source"]["ref"], "main");
+        assert_eq!(value["source"]["depth"], 1);
+
+        let value = serde_json::to_value(inline(&[("Cargo.toml", "x")])).unwrap();
+        assert_eq!(value["source"]["kind"], "inline");
+        assert_eq!(value["source"]["files"][0]["path"], "Cargo.toml");
+        assert_eq!(value["source"]["files"][0]["text"], "x");
+    }
+}
