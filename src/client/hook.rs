@@ -35,9 +35,10 @@ impl HookKind {
 
 /// Install one hook in the repository containing `dir`.
 ///
-/// `kind` is the job kind the hook runs: `check` for pre-push (fmt + clippy + test) and `lint`
-/// for pre-commit (fmt + clippy), because a commit-time gate that waits for a cold test build is
-/// a gate people disable.
+/// `kind` is the job kind the hook runs: `check` for pre-push (every check the repository's
+/// toolchain runs) and `lint` for pre-commit (the fast static checks only), because a commit-time
+/// gate that waits for a cold test build is a gate people disable. The profile is detected at
+/// run time from the tree, so one hook works in every repository.
 pub fn install(dir: &Path, hook: HookKind, kind: JobKind, force: bool) -> Result<PathBuf, String> {
     let path = hook_path(dir, hook)?;
     if path.exists() && !force {

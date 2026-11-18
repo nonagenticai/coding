@@ -327,6 +327,87 @@ async fn create_job_with_an_inline_source_is_202_and_stores_the_typed_input() {
     pool.close().await;
 }
 
+#[tokio::test]
+async fn a_python_job_stores_its_profile_and_a_rust_job_omits_the_default() {
+    let (state, pool) = state_with_db().await;
+    let tenant = unique_tenant("http-profile");
+
+    let resp = post_job(
+        state.clone(),
+        &tenant,
+        serde_json::json!({
+            "kind": "lint",
+            "input": {
+                "profile": "python",
+                "source": {"kind": "inline", "files": [
+                    {"path": "pyproject.toml", "text": "[project]\nname = \"x\"\n"}
+                ]}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let python: serde_json::Value = sqlx::query_scalar(
+        "SELECT input FROM jobs WHERE tenant_id = $1 AND input->>'profile' = 'python'",
+    )
+    .bind(&tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("the python job's stored input");
+    assert_eq!(python["source"]["kind"], "inline");
+
+    let resp = post_job(
+        state,
+        &tenant,
+        serde_json::json!({
+            "kind": "lint",
+            "input": {"source": {"kind": "inline", "files": [
+                {"path": "Cargo.toml", "text": "[package]\nname = \"x\"\n"}
+            ]}}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    // The default is not serialized: a runner image built before profiles existed denies
+    // unknown fields, so a Rust job must store exactly the input it stored before.
+    let rust_with_a_profile: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs
+          WHERE tenant_id = $1 AND input ? 'profile' AND input->>'profile' <> 'python'",
+    )
+    .bind(&tenant)
+    .fetch_one(&pool)
+    .await
+    .expect("count rust jobs carrying a profile");
+    assert_eq!(
+        rust_with_a_profile, 0,
+        "a rust job must not carry a profile key"
+    );
+
+    sqlx::query("DELETE FROM jobs WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn an_unknown_profile_is_rejected_at_the_edge() {
+    let resp = post_job(
+        state(),
+        "contract-tenant",
+        serde_json::json!({
+            "kind": "lint",
+            "input": {
+                "profile": "golang",
+                "source": {"kind": "inline", "files": [{"path": "go.mod", "text": "module x\n"}]}
+            }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 /// A small, valid archive: the same packer the client uses.
 fn sample_archive() -> Vec<u8> {
     coding::source_archive::pack(&[

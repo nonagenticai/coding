@@ -1,14 +1,20 @@
-# Runner image: the Rust toolchain plus `coding-runner`, which is the ENTRYPOINT.
+# Runner image: the toolchains plus `coding-runner`, which is the ENTRYPOINT.
 #
 # One Pod per job, under the `coding-kata` RuntimeClass. The Pod's root filesystem is read-only,
 # so every writable path below is under /tmp (the 8 GiB scratch emptyDir the sandbox mounts):
 #   /tmp/src     the job's checked-out source          (written by coding-runner)
 #   /tmp/src.target  cargo's target directory          (set by coding-runner)
 #   /tmp/cargo   CARGO_HOME                            (must be writable for the registry cache)
+#   /tmp/uv-cache  uv's cache                          (set by coding-runner for Python steps)
+#
+# Two profiles share this image, chosen per job by `coding-runner`:
+#   rust    cargo fmt / clippy / build / test (the Rust toolchain below)
+#   python  uv lock / sync, ruff, ty, pytest  (uv + one CPython, installed read-only below)
 #
 # No docker, no container runtime, no cluster client: this image only runs cargo, rustfmt,
-# clippy and git on behalf of one job. Its own dependencies are installed from Debian and
-# rustup; the job's crates come from crates.io over the sandbox's HTTPS egress.
+# clippy, uv, ruff, ty, pytest and git on behalf of one job. Its own dependencies are installed
+# from Debian, rustup and python-build-standalone; the job's crates and wheels come from
+# crates.io and pypi.org over the sandbox's HTTPS egress.
 #
 # RUST_TOOLCHAIN must equal rust-toolchain.toml and rust_toolchain in .github/workflows/ci.yml.
 ARG RUST_TOOLCHAIN=1.99.0
@@ -68,15 +74,29 @@ ENV RUSTUP_HOME=/opt/rustup \
     PATH=/opt/cargo/bin:/usr/local/bin:/usr/lib/postgresql/18/bin:/usr/bin:/bin
 
 COPY --from=build /opt/rustup /opt/rustup
-COPY --from=build /opt/cargo /opt/cargo
+# Runtime CARGO_HOME is /tmp/cargo, so the build stage's registry cache is dead weight here; the
+# toolchain lives in /opt/rustup and only the shims in /opt/cargo/bin are needed beside it.
+COPY --from=build /opt/cargo/bin /opt/cargo/bin
 COPY --from=build /out/coding-runner /usr/local/bin/coding-runner
-# The toolchain is pre-installed; rustup must never try to download at run time.
+
+# The Python profile's toolchain: uv (the public archetype's version) and one CPython it manages.
+# The interpreter is read-only here and `coding-runner` points uv at it
+# (UV_PYTHON_INSTALL_DIR) with downloads off, so a job cannot fetch another interpreter into its
+# 8 GiB scratch; a repository that pins a different Python version fails with uv's own message.
+COPY --from=ghcr.io/astral-sh/uv:0.13.7 /uv /usr/local/bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv/python
+RUN uv python install 3.14
+
+# The toolchain is pre-installed; rustup and uv must never try to download at run time.
 # The Postgres check proves the throwaway cluster can actually start in this image: a runner that
 # discovers the missing binary mid-job reports a setup error for a plan that never ran.
 RUN /opt/cargo/bin/rustc --version \
     && /opt/cargo/bin/cargo --version \
     && /opt/cargo/bin/cargo fmt --version \
     && /opt/cargo/bin/cargo clippy --version \
+    && uv --version \
+    && uv python find 3.14 \
+    && uv run --no-project python -V \
     && initdb --version \
     && pg_ctl --version \
     && redis-server --version \

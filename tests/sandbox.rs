@@ -137,6 +137,10 @@ fn config(api_url: &str) -> SandboxConfig {
     SandboxConfig {
         namespace: "coding-runs".to_owned(),
         runner_image: IMAGE.to_owned(),
+        profiles: vec![
+            coding::domain::Profile::Rust,
+            coding::domain::Profile::Python,
+        ],
         runtime_class: "coding-kata".to_owned(),
         api_url: api_url.to_owned(),
         token: "test-token".to_owned(),

@@ -20,7 +20,10 @@ fn spec(kind: JobKind, source: Option<Source>) -> RunnerSpec {
         attempt: 1,
         workspace_id: None,
         deadline_seconds: 120,
-        input: JobInput { source },
+        input: JobInput {
+            source,
+            ..Default::default()
+        },
     }
 }
 

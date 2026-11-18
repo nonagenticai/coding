@@ -7,18 +7,19 @@ runtime of its own.
 Two consumers:
 
 - **Automation** — a code toolset over HTTP (`POST /api/jobs`, `POST /api/jobs/status`).
-- **Developers** — `coding check`, a pre-push/pre-commit gate that runs a repository's
-  formatting, clippy and tests in the same job image CI uses, from a machine with no toolchain
-  and no Docker.
+- **Developers** — `coding check`, a pre-push/pre-commit gate that runs the repository's own
+  checks in the same job image CI uses, from a machine with no toolchain and no Docker: cargo
+  fmt/clippy/test for Rust, uv/ruff/ty/pytest for Python.
 
 ## Quality gate: `coding check`
 
 ```bash
 # CODING_URL points at the service (or a tunnel to it)
-CODING_URL=http://127.0.0.1:8687 coding check          # fmt + clippy + test, one Pod
-CODING_URL=http://127.0.0.1:8687 coding check --kind lint   # fmt + clippy only
+CODING_URL=http://127.0.0.1:8687 coding check          # every check, one Pod
+CODING_URL=http://127.0.0.1:8687 coding check --kind lint   # static checks only
+CODING_URL=http://127.0.0.1:8687 coding check --profile python  # force a toolchain
 CODING_URL=http://127.0.0.1:8687 coding check --dry-run     # show what would be sent
-coding hook install                                     # pre-push gate (fmt + clippy + test)
+coding hook install                                     # pre-push gate
 coding hook install --hook pre-commit --kind lint       # committed fast gate, if you want one
 git config coding.url http://127.0.0.1:8687             # what the hook reads
 ```
@@ -48,12 +49,34 @@ Measured latency (one cold Pod): a tiny crate is 12–43 s end to end; a medium 
 a few minutes (fmt + clippy + test). That is why pre-push is the default and `--kind lint` exists
 for anyone who wants a commit-time gate.
 
+### Profiles
+
+The tree decides the toolchain; there is no language-specific job kind.
+
+| profile | detected by | the `check` plan |
+|---|---|---|
+| `rust` | `Cargo.toml` + `Cargo.lock` | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked` |
+| `python` | `pyproject.toml` + `uv.lock` | `uv lock --check`, `uv sync --all-extras --locked`, `ruff check`, `ruff format --check`, `ty check`, `pytest -v --tb=short` |
+
+`--profile auto` (the default) detects the profile from the packed tree; a repository carrying
+both toolchains must choose with `--profile rust|python`, and a tree without either pair is a
+usage error before anything is uploaded. `rust` is the server-side default and the field is
+omitted from the request for it, so a Rust job sends exactly the body it sent before profiles
+existed. The runner checks the same marker again against the materialised tree and answers
+`unsupported` (exit 2), never a failing check.
+
+The Python plan mirrors the estate's Python CI command for command, so the gate's verdict is the
+one CI would give. Two limits today: the image carries CPython 3.14 only (a repository pinning
+another version fails with uv's own message), and `--kind build` is `unsupported` for Python
+because the Python archetype has no build gate to mirror.
+
 The worker runs up to `CODING_WORKER_CONCURRENCY` jobs at once (default 4). Every claim carries
 its own fencing token, so a slot that lost its lease can never heartbeat, complete, fail or
 cancel the job a newer claim owns, and a slot that panics cannot leave its lease renewing;
 shutdown drains every in-flight job. A job's Pod lives for that job's own deadline (the request
 timeout plus five minutes of pull/exit slack), not a fixed 15 minutes, so a long check is not
-killed mid-run.
+killed mid-run. `CODING_RUNNER_PROFILES` (default `rust`) says which profiles the configured
+runner image carries; a job naming any other profile is refused before a Pod is created.
 
 A `test` or `check` job starts a **throwaway PostgreSQL 18 inside its own Pod** and exports
 `TEST_DATABASE_URL`, the same DSN CI hands to the same harnesses. It starts immediately before
@@ -61,7 +84,10 @@ the test step (never during `fmt`/`clippy`); a `TEST_DATABASE_URL` already in th
 wins. Beside it the job starts a **throwaway Redis** and exports `TEST_REDIS_URL` and `REDIS_URL`
 (an exported one wins), plus a second private server exported as `TEST_REDIS_PRIVATE_URL` for a
 test whose `FLUSHALL` must not touch its siblings. A server that is still not listening is exit
-3, never a failed check: a dead database is not a verdict about your code.
+3, never a failed check: a dead database is not a verdict about your code. For the `python`
+profile the test step also exports `DATABASE_URL` in the SQLAlchemy spelling
+(`postgresql+psycopg://…`, the same server) and `REDIS_HOST`/`REDIS_PORT`, because the estate's
+Python services read those names.
 
 ## Stack
 
@@ -89,7 +115,7 @@ Rust 1.99.0 (pinned in `rust-toolchain.toml` and the Dockerfile `ARG RUST_TOOLCH
 | `src/db.rs` | pool + `MIGRATOR` (`migrations/*.sql`, run at startup) |
 | `src/error.rs` | `AppError` renders `{"detail": ...}` like FastAPI |
 | `parity.toml`, `parity/` | parity contract with the Python source(s) |
-| `images/runner-rust/` | the job image: Rust toolchain + `coding-runner` |
+| `images/runner/` | the job image: the Rust and Python toolchains + `coding-runner` |
 | `Dockerfile` | the control-plane image |
 
 ## Run and test
@@ -116,7 +142,7 @@ PostgreSQL 18 and Redis service containers, doctests and `cargo audit`. The imag
 control-plane image and smokes `--version` / `--print-openapi`; it pushes to ghcr.io only when
 the repository variable `PUBLISH_IMAGE=true`.
 
-The job image (`images/runner-rust/Dockerfile`) is built separately, with the same public bases.
+The job image (`images/runner/Dockerfile`) is built separately, with the same public bases.
 
 ## License
 

@@ -14,7 +14,7 @@ use tokio::process::Command;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::Instant as TokioInstant;
 
-use crate::domain::Source;
+use crate::domain::{Profile, Source};
 use crate::runner::plan;
 use crate::runner::postgres;
 use crate::runner::redis;
@@ -91,12 +91,13 @@ pub async fn run_in(
     cancel: &mut Cancellation,
     source_dir: &Path,
 ) -> RunnerResult {
-    let Some(planned) = plan(spec.kind) else {
+    let Some(planned) = plan(spec.input.profile, spec.kind) else {
         return RunnerResult::new(
             Status::Unsupported,
             format!(
-                "kind {} is not implemented by this runner",
-                spec.kind.as_str()
+                "kind {} is not implemented for profile {} by this runner",
+                spec.kind.as_str(),
+                spec.input.profile.as_str()
             ),
         );
     };
@@ -148,6 +149,20 @@ pub async fn run_in(
 
     let mut result = RunnerResult::new(Status::Succeeded, String::new()).with_source(source_info);
 
+    // The profile is the caller's claim about the tree. A tree without the profile's marker is a
+    // mismatch, not a failing check: running cargo in a Python tree (or uv in a Rust one) fails
+    // for a reason that says nothing about the repository. The API checked the same shape, and
+    // this process checks it again because the spec arrives through a Pod env var.
+    let marker = spec.input.profile.marker_file();
+    if !source_dir.join(marker).is_file() {
+        result.status = Status::Unsupported;
+        result.summary = format!(
+            "profile {} expects {marker} at the root of the source; it is not there",
+            spec.input.profile.as_str()
+        );
+        return result;
+    }
+
     // A plan that runs a test suite gets a throwaway database, exactly as CI and rbuild give one:
     // the estate's harnesses fail CLOSED without `TEST_DATABASE_URL`, so a repository whose tests
     // touch a database would otherwise report a failing run for a reason that is not its code.
@@ -194,7 +209,11 @@ pub async fn run_in(
     // CARGO_TARGET_DIR (which in CI points at the outer build).
     let target_dir = target_dir_for(source_dir);
     let mut database_url: Option<String> = None;
+    // The same database in the spelling the estate's Python suites read (SQLAlchemy + psycopg).
+    let mut database_alias: Option<String> = None;
     let mut redis_url: Option<String> = None;
+    // The port the started Redis actually listens on, for the Python suite's REDIS_HOST/REDIS_PORT.
+    let mut redis_port: Option<String> = None;
     let mut private_redis_url: Option<String> = None;
     for step in planned {
         // A step is attempted twice **only** when the database died under it. The first attempt's
@@ -217,6 +236,7 @@ pub async fn run_in(
                             step.name,
                             crate::runner::postgres::accepting_connections().await
                         );
+                        database_alias = Some(sqlalchemy_dsn(&url));
                         database_url = Some(url);
                     }
                     Err(error) => {
@@ -240,6 +260,7 @@ pub async fn run_in(
                             step.name,
                             crate::runner::redis::accepting_connections(port).await
                         );
+                        redis_port = Some(port.to_string());
                         redis_url = Some(url);
                     }
                     Err(error) => {
@@ -277,14 +298,36 @@ pub async fn run_in(
             }
             // Only a step that needs a service is told about it: a build script must not probe an
             // address whose server has not started.
+            let python = spec.input.profile == Profile::Python;
             let env: Vec<(&str, &str)> = {
                 let mut env = Vec::new();
+                if python {
+                    // The runner image's Python is read-only and preinstalled; every writable
+                    // path a job needs is under the /tmp scratch the sandbox mounts, and
+                    // downloads are off so uv cannot fetch a CPython into that scratch per job.
+                    env.push(("HOME", "/tmp"));
+                    env.push(("UV_CACHE_DIR", "/tmp/uv-cache"));
+                    env.push(("UV_PYTHON_INSTALL_DIR", crate::runner::PYTHON_INSTALL_DIR));
+                    env.push(("UV_PYTHON_DOWNLOADS", "never"));
+                }
                 if let (true, Some(url)) = (step.needs_database, database_url.as_deref()) {
                     env.push(("TEST_DATABASE_URL", url));
+                    if python {
+                        // The same server in the estate's Python spelling: SQLAlchemy names the
+                        // driver, and the driver is psycopg v3 (`postgresql+psycopg://`).
+                        if let Some(alias) = database_alias.as_deref() {
+                            env.push(("DATABASE_URL", alias));
+                        }
+                    }
                 }
                 if let (true, Some(url)) = (step.needs_redis, redis_url.as_deref()) {
                     env.push(("TEST_REDIS_URL", url));
                     env.push(("REDIS_URL", url));
+                    if python {
+                        // The estate's Python services read the host/port pair, not a URL.
+                        env.push(("REDIS_HOST", "127.0.0.1"));
+                        env.push(("REDIS_PORT", redis_port.as_deref().unwrap_or("6379")));
+                    }
                 }
                 if let (true, Some(url)) = (step.needs_redis, private_redis_url.as_deref()) {
                     env.push(("TEST_REDIS_PRIVATE_URL", url));
@@ -1105,6 +1148,20 @@ fn target_dir_for(source_dir: &Path) -> PathBuf {
     PathBuf::from(format!("{}.target", source_dir.display()))
 }
 
+/// The SQLAlchemy/psycopg v3 spelling of a PostgreSQL URL, derived from the same URL the step is
+/// told to use. `postgres://` and `postgresql://` are the same DSN; SQLAlchemy needs the driver
+/// named, and the estate's driver is psycopg v3 (`postgresql+psycopg://`).
+fn sqlalchemy_dsn(url: &str) -> String {
+    if let Some(rest) = url
+        .strip_prefix("postgres://")
+        .or_else(|| url.strip_prefix("postgresql://"))
+    {
+        format!("postgresql+psycopg://{rest}")
+    } else {
+        url.to_owned()
+    }
+}
+
 /// Run one child under the job deadline and SIGTERM.
 async fn run_child(
     mode: Mode,
@@ -1272,6 +1329,25 @@ mod tests {
         let big = "x".repeat(MAX_ERROR_TEXT * 2);
         assert!(tail(&big).len() <= MAX_ERROR_TEXT + 4);
         assert_eq!(tail("  short  "), "short");
+    }
+
+    #[test]
+    fn the_python_database_alias_names_the_driver() {
+        // Both PostgreSQL spellings are the same DSN; SQLAlchemy must still be told the driver,
+        // and a test suite that reads DATABASE_URL fails on "no driver" otherwise.
+        assert_eq!(
+            sqlalchemy_dsn("postgres://postgres:pw@127.0.0.1:5432/postgres"),
+            "postgresql+psycopg://postgres:pw@127.0.0.1:5432/postgres"
+        );
+        assert_eq!(
+            sqlalchemy_dsn("postgresql://a@b:1/c"),
+            "postgresql+psycopg://a@b:1/c"
+        );
+        // Anything already carrying a driver-qualified scheme is left alone.
+        assert_eq!(
+            sqlalchemy_dsn("postgresql+psycopg://a@b:1/c"),
+            "postgresql+psycopg://a@b:1/c"
+        );
     }
 
     #[tokio::test]

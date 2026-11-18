@@ -16,7 +16,7 @@ name: runner image
 on:
   pull_request:
     paths:
-      - "images/runner-rust/**"
+      - "images/runner/**"
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -25,7 +25,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "images/runner-rust/**"
+      - "images/runner/**"
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
@@ -67,7 +67,7 @@ jobs:
       #   condition is how a Dockerfile stops being compiled at all until release day; the
       #   private-era workflow made exactly that mistake and had it recorded in its header.
       - name: build
-        run: docker build --file images/runner-rust/Dockerfile --tag "$IMG" .
+        run: docker build --file images/runner/Dockerfile --tag "$IMG" .
 
       # The only property this image must have at build time: it execs. The real proof is a
       # kata Pod running a job, which no docker step can substitute for.
