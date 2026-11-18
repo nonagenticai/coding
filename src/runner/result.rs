@@ -98,6 +98,18 @@ pub struct LogInfo {
     pub truncated: bool,
 }
 
+/// What the compilation cache did for this job.
+///
+/// Informational only: the verdict comes from the checks, and a job whose cache was unreachable
+/// renders exactly like one whose cache missed every time. Reporting it is what makes the warm/cold
+/// measurement possible without scraping logs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    pub errors: u64,
+}
+
 /// The value inside the final `{"coding_result": …}` line.
 #[derive(Debug, Clone, Serialize)]
 pub struct RunnerResult {
@@ -118,6 +130,9 @@ pub struct RunnerResult {
     /// Why the spec or the source setup failed, when that is the outcome.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Compilation-cache counters, when a cache was configured and it answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheStats>,
     /// Log-read metadata.
     pub log: LogInfo,
 }
@@ -132,6 +147,7 @@ impl RunnerResult {
             source: None,
             sources: Vec::new(),
             error: None,
+            cache: None,
             log: LogInfo { truncated: false },
         }
     }
