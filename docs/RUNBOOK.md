@@ -31,6 +31,10 @@ the flag against an old digest is refused at job create (`sandbox_not_configured
 | `CODING_RUNS_PULL_SECRET` | worker | image pull secret name, when the registry needs one |
 | `CODING_GITHUB_APP_ID`, `CODING_GITHUB_APP_INSTALLATION_ID`, `CODING_GITHUB_APP_PRIVATE_KEY_PATH` | worker | App identity for private clones |
 | `CODING_GITHUB_API_BASE` | worker | optional; GitHub Enterprise API base |
+| `CODING_SCCACHE_BUCKET` | worker | unset/empty disables the compilation cache |
+| `CODING_SCCACHE_ENDPOINT` | worker | **required** with a bucket; the S3 endpoint (this repo is public, so no default address is compiled in) |
+| `CODING_SCCACHE_KEY_PREFIX` | worker | base prefix, default `coding/`; a job writes `<base>git/` or `<base>uploads/` |
+| `CODING_SCCACHE_WRITE_REPOS` | worker | comma-separated repo URLs that use the trusted `git/` namespace; everything else uses `uploads/` |
 | `CODING_JOB_SPEC` | runner | the one-job spec; set by the worker, never by a caller |
 
 ## Verify a deployment
@@ -60,6 +64,25 @@ Kustomization's `lastAppliedRevision` names a commit your merge is an ancestor o
 | exit 3 | a throwaway PostgreSQL/Redis died or never started — infrastructure, not the code |
 | `runner_failed` | the Pod ended without a result line |
 | `timeout` | the job's `timeout_seconds` (default 900) expired; the Pod is reaped |
+
+## Compilation cache (sccache)
+
+A run Pod has only an `emptyDir`, so without a cache every job recompiles its dependencies. The
+runner image carries sccache; the worker switches it on when `CODING_SCCACHE_BUCKET` is set.
+
+- **Two namespaces in one bucket.** A job whose every source is a git repository on
+  `CODING_SCCACHE_WRITE_REPOS` writes `<base>git/`; everything else — the commit gate's uploaded
+  working tree included — writes `<base>uploads/`. Each is a separate MinIO identity confined to its
+  own subtree, so an upload cannot write an object a trusted build reads.
+- **The credential is an OPTIONAL `secretKeyRef`.** A missing Secret, an unreachable bucket or an
+  image without the binary all leave the build uncached; a cache failure is never a failed check.
+- **Verify it actually cached.** The result carries `cache {hits, misses, errors}` when sccache
+  answered, and the Pod log prints `sccache hits=… misses=… errors=…`. ⛔ Never take the job's exit
+  code as evidence: sccache logs a cache error and compiles anyway, so a broken cache looks exactly
+  like a green job that got slower.
+- **Cold vs warm** is measured on the same commit: the first run after a prefix is empty is cold,
+  the next two are warm, and the median of the warm runs is the number that matters to a
+  pre-commit gate.
 
 ## Local gate (before a push)
 
