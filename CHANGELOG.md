@@ -27,6 +27,9 @@ All notable changes to this project are documented here. The format follows
   by the worker's 256 KiB log read.
 - The source reaper now also sees upload ids referenced from a job's `sources` list, so a queued
   multi-source job cannot have its archive reaped under it.
+- A multi-source job's step failures (timeout, cancel, a service that will not start or dies, a
+  step that cannot start) name the source they happened in, and every upload id in `sources[]` is
+  ownership-checked at create time (404), not left for the worker to discover after a 202.
 
 ### Added (earlier unreleased work)
 

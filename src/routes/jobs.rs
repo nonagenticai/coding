@@ -14,9 +14,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::AppState;
-use crate::domain::{
-    CreateJobRequest, ErrorBody, ErrorDetail, InputError, Job, JobStatusRequest, Source,
-};
+use crate::domain::{CreateJobRequest, ErrorBody, ErrorDetail, InputError, Job, JobStatusRequest};
 use crate::error::AppError;
 use crate::store;
 use crate::tenant::{TenantHeader, TenantId};
@@ -47,9 +45,11 @@ pub async fn create_job(
     if let Err(error) = req.input.validate(req.kind) {
         return invalid_input(error);
     }
-    // An uploaded source must already belong to this tenant: naming another tenant's id would
-    // otherwise let a job read an archive the caller never uploaded.
-    if let Some(Source::Upload { id, .. }) = &req.input.source {
+    // Every uploaded source must already belong to this tenant: naming another tenant's id would
+    // otherwise let a job read an archive the caller never uploaded. Both the single and the
+    // multi-source form are checked here, so a bad id is a 404 at create time — never a 202
+    // followed by a claim-time failure.
+    for id in req.input.upload_source_ids() {
         match store::owns_source(&state.pool, tenant.as_str(), id).await {
             Ok(true) => {}
             Ok(false) => return AppError::NotFound(format!("source {id}")).into_response(),

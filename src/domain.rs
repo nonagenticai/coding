@@ -328,6 +328,24 @@ impl JobInput {
         Ok(())
     }
 
+    /// Every upload id this input references, in whichever form it uses.
+    ///
+    /// The route checks each one belongs to the caller before a row exists: without that, a
+    /// foreign or stale id is accepted here and only refused by the worker at claim time, after
+    /// the caller has been told 202.
+    pub fn upload_source_ids(&self) -> Vec<&str> {
+        let mut ids = Vec::new();
+        if let Some(Source::Upload { id, .. }) = &self.source {
+            ids.push(id.as_str());
+        }
+        for named in &self.sources {
+            if let Source::Upload { id, .. } = &named.source {
+                ids.push(id.as_str());
+            }
+        }
+        ids
+    }
+
     /// The rules that hold for every kind, including the ones that run no code.
     fn validate_shape(&self) -> Result<(), InputError> {
         if self.source.is_some() && !self.sources.is_empty() {

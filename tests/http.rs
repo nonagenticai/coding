@@ -695,11 +695,29 @@ async fn a_job_cannot_name_another_tenants_source() {
     let id = created["id"].as_str().expect("id").to_owned();
 
     let resp = post_job(
-        state,
+        state.clone(),
         &other,
         serde_json::json!({
             "kind": "check",
             "input": {"source": {"kind": "upload", "id": id}},
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"]["code"], "not_found", "{body}");
+
+    // The same rule inside the multi-source form: a foreign id is refused at create time, not
+    // accepted 202 and failed later by the worker.
+    let resp = post_job(
+        state.clone(),
+        &other,
+        serde_json::json!({
+            "kind": "check",
+            "input": {"sources": [
+                {"name": "target", "profile": "rust",
+                 "source": {"kind": "upload", "id": id}}
+            ]},
         }),
     )
     .await;

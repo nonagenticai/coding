@@ -44,6 +44,8 @@ struct StubInner {
     pods: Vec<Value>,
     log: String,
     deletes: Vec<String>,
+    /// Every Pod manifest the client created, in order — what the worker actually sent.
+    created: Vec<Value>,
 }
 
 fn stub(inner: StubInner) -> Stub {
@@ -82,6 +84,8 @@ async fn create_pod(State(stub): State<Stub>, Json(manifest): Json<Value>) -> Re
         .as_str()
         .unwrap_or_default()
         .to_owned();
+    let mut inner = inner;
+    inner.created.push(manifest);
     (
         StatusCode::CREATED,
         Json(json!({ "metadata": { "name": name } })),
@@ -639,4 +643,120 @@ async fn failed_reports_the_reason_and_the_log_tail() {
         vec!["coding-run-job-1".to_owned()],
         "the pod is deleted before returning"
     );
+}
+
+/// Every upload source of a multi-source job is prepared with its own fetch URL, capability
+/// token and hash before the Pod exists. Without a test here the loop could silently skip the
+/// upload branch and every job would fail later, after a 202 — fail-open in the wrong direction.
+#[tokio::test]
+async fn every_named_upload_source_is_prepared_with_its_own_capability() {
+    let url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point at a real Postgres 18: this test never skips");
+    let pool = coding::db::connect(&url)
+        .await
+        .expect("connect TEST_DATABASE_URL");
+    coding::db::migrate(&pool).await.expect("migrate");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let tenant = format!("sandbox-sources-{}-{nanos}", std::process::id());
+
+    async fn store(pool: &sqlx::PgPool, tenant: &str, marker: &str) -> String {
+        let blob = coding::source_archive::pack(&[
+            coding::source_archive::PackFile {
+                path: "Cargo.toml".to_owned(),
+                data: b"[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n"
+                    .to_vec(),
+                executable: false,
+            },
+            coding::source_archive::PackFile {
+                path: "src/lib.rs".to_owned(),
+                data: marker.as_bytes().to_vec(),
+                executable: false,
+            },
+        ])
+        .expect("pack");
+        coding::store::create_source(
+            pool,
+            tenant,
+            &coding::source_archive::sha256_hex(&blob),
+            blob.len() as i64,
+            2,
+            &blob,
+        )
+        .await
+        .expect("store")
+    }
+    let first = store(&pool, &tenant, "pub fn one() {}").await;
+    let second = store(&pool, &tenant, "pub fn two() {}").await;
+
+    let stub = stub(StubInner {
+        pod: Some(json!({ "status": { "phase": "Succeeded" } })),
+        log:
+            "{\"coding_result\":{\"status\":\"succeeded\",\"summary\":\"2 of 2 checks passed\"}}\n"
+                .to_owned(),
+        ..Default::default()
+    });
+    let sandbox = sandbox_for(&stub).await;
+
+    // The mint casts the job id to uuid (token_job_id) and is scoped to the claim's tenant, so
+    // both must match what the store holds.
+    let mut claim = claim("11111111-1111-4111-8111-111111111111", JobKind::Test, 60);
+    claim.tenant_id = tenant.clone();
+    claim.input = json!({"sources": [
+        {"name": "one", "profile": "rust", "source": {"kind": "upload", "id": first}},
+        {"name": "two", "profile": "rust", "source": {"kind": "upload", "id": second}}
+    ]});
+    // An upload source needs the API base the Pod fetches from; `run_job` passes none.
+    let result = execute_sandbox(
+        &sandbox,
+        &pool,
+        Some("http://coding.example.test:8687"),
+        None,
+        claim,
+    )
+    .await
+    .expect("the stub pod succeeds");
+    assert_eq!(result["status"], "succeeded");
+
+    let created = stub.inner.lock().expect("stub lock").created.clone();
+    assert_eq!(created.len(), 1, "exactly one Pod was created");
+    let spec_text = created[0]["spec"]["containers"][0]["env"][0]["value"]
+        .as_str()
+        .expect("the spec rides in CODING_JOB_SPEC");
+    let spec: Value = serde_json::from_str(spec_text).expect("spec json");
+    let sources = spec["input"]["sources"].as_array().expect("sources");
+    assert_eq!(sources.len(), 2);
+    for (index, id) in [&first, &second].iter().enumerate() {
+        let source = &sources[index]["source"];
+        let url = source["url"].as_str().expect("a fetch url");
+        assert!(
+            url.ends_with(&format!("/api/sources/{id}/blob")),
+            "source {index} url {url}"
+        );
+        assert!(
+            source["sha256"]
+                .as_str()
+                .is_some_and(|hash| hash.len() == 64),
+            "source {index} carries the recorded hash"
+        );
+        assert!(
+            source["token"]
+                .as_str()
+                .is_some_and(|token| !token.is_empty()),
+            "source {index} carries its capability"
+        );
+    }
+    assert_ne!(
+        sources[0]["source"]["token"], sources[1]["source"]["token"],
+        "each upload gets its own capability, not one shared by the job"
+    );
+
+    sqlx::query("DELETE FROM sources WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+    pool.close().await;
 }
