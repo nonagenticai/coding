@@ -53,30 +53,32 @@ pub const DEFAULT_PULL_SECRET: &str = "registry-pull-secret";
 /// `CODING_SCCACHE_BUCKET` (optional): the MinIO bucket for the compilation cache. Unset or empty
 /// disables the cache entirely, and a job then runs exactly as it did before caching existed.
 pub const SCCACHE_BUCKET_ENV: &str = "CODING_SCCACHE_BUCKET";
-/// `CODING_SCCACHE_ENDPOINT`: the S3 endpoint sccache talks to. Defaults to the estate's MinIO.
+/// `CODING_SCCACHE_ENDPOINT`: the S3 endpoint sccache talks to. **Required whenever the bucket is
+/// set** — this is a public repository, so no private infrastructure address is baked in here; the
+/// deployment supplies it.
 pub const SCCACHE_ENDPOINT_ENV: &str = "CODING_SCCACHE_ENDPOINT";
 /// `CODING_SCCACHE_REGION`: MinIO ignores a region; the AWS SDK does not accept a request without
 /// one.
 pub const SCCACHE_REGION_ENV: &str = "CODING_SCCACHE_REGION";
 /// `CODING_SCCACHE_USE_SSL`: `true` when the endpoint is https.
 pub const SCCACHE_USE_SSL_ENV: &str = "CODING_SCCACHE_USE_SSL";
-/// `CODING_SCCACHE_KEY_PREFIX`: the object prefix. The CI runners share the same bucket and write
-/// at the root (`.github/workflows/rust-library.yml`), so job objects live under their own prefix.
+/// `CODING_SCCACHE_KEY_PREFIX`: the base object prefix. Trusted git builds live under `<base>git/`
+/// and everything else under `<base>uploads/` — two caches that never read each other's objects.
+/// The CI runners share the same bucket and write at the root
+/// (`.github/workflows/rust-library.yml`).
 pub const SCCACHE_KEY_PREFIX_ENV: &str = "CODING_SCCACHE_KEY_PREFIX";
-/// `CODING_SCCACHE_SECRET_RW`: the Secret in `coding-runs` holding the read-write credential.
-pub const SCCACHE_SECRET_RW_ENV: &str = "CODING_SCCACHE_SECRET_RW";
-/// `CODING_SCCACHE_SECRET_RO`: the Secret in `coding-runs` holding the read-only credential.
-pub const SCCACHE_SECRET_RO_ENV: &str = "CODING_SCCACHE_SECRET_RO";
-/// `CODING_SCCACHE_WRITE_REPOS`: comma-separated repository URLs whose jobs may WRITE the cache.
-/// Empty is the safe default: every job reads, none writes.
+/// `CODING_SCCACHE_SECRET_GIT_RW`: the write credential scoped to the git namespace.
+pub const SCCACHE_SECRET_GIT_RW_ENV: &str = "CODING_SCCACHE_SECRET_GIT_RW";
+/// `CODING_SCCACHE_SECRET_UPLOADS_RW`: the write credential scoped to the uploads namespace.
+pub const SCCACHE_SECRET_UPLOADS_RW_ENV: &str = "CODING_SCCACHE_SECRET_UPLOADS_RW";
+/// `CODING_SCCACHE_WRITE_REPOS`: comma-separated repository URLs whose jobs use the **git**
+/// namespace, with the write credential. Empty is the safe default: every job uses `uploads/`.
 pub const SCCACHE_WRITE_REPOS_ENV: &str = "CODING_SCCACHE_WRITE_REPOS";
 
-/// The estate's MinIO is a bare-metal systemd unit on mf1, reached by its tailnet name.
-pub const DEFAULT_SCCACHE_ENDPOINT: &str = "http://minio.internal:8389";
 /// MinIO ignores the region, but the S3 client requires a syntactically valid one.
 pub const DEFAULT_SCCACHE_REGION: &str = "us-east-1";
-pub const DEFAULT_SCCACHE_SECRET_RW: &str = "coding-sccache-rw";
-pub const DEFAULT_SCCACHE_SECRET_RO: &str = "coding-sccache-ro";
+pub const DEFAULT_SCCACHE_SECRET_GIT_RW: &str = "coding-sccache-git-rw";
+pub const DEFAULT_SCCACHE_SECRET_UPLOADS_RW: &str = "coding-sccache-uploads-rw";
 pub const DEFAULT_SCCACHE_KEY_PREFIX: &str = "coding/";
 /// `SANDBOX_API_URL`: overrides the in-cluster API address (tests use a local stub).
 pub const API_URL_ENV: &str = "SANDBOX_API_URL";
@@ -167,23 +169,39 @@ pub enum SandboxError {
 
 /// The compilation-cache settings carried into every runner Pod.
 ///
-/// The credentials travel as `secretKeyRef` environment references, never as values in the spec.
-/// A Pod holding a read-write key can PUT arbitrary objects in the bucket no matter how sccache
-/// derives its own keys, so a job gets the write credential only when **every** one of its sources
-/// is a git repository on the allowlist; uploaded and inline source get the read-only key. A
-/// missing Secret is not an error: the references are `optional`, so the Pod starts and compiles
-/// without a cache.
+/// Two namespaces, two write identities: a trusted git build uses `<prefix>git/` with a credential
+/// the MinIO policy confines to that subtree, and everything else — uploaded working trees and
+/// inline files — uses `<prefix>uploads/` with its own confined credential. Neither builder can
+/// write the other's subtree, and neither reads the other's objects.
+///
+/// The credential travels as a `secretKeyRef`, never as a value in the spec. A missing Secret is
+/// not an error: the references are `optional`, so the Pod starts and compiles without a cache.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CacheConfig {
     pub bucket: String,
     pub endpoint: String,
     pub region: String,
     pub use_ssl: bool,
+    /// Base prefix, always ending in `/`.
     pub key_prefix: String,
-    pub secret_rw: String,
-    pub secret_ro: String,
-    /// Normalised repository URLs permitted to write. Empty = read-only for every job.
+    pub secret_git_rw: String,
+    pub secret_uploads_rw: String,
+    /// Normalised repository URLs whose jobs use the git namespace and its write credential.
     pub write_repos: Vec<String>,
+}
+
+impl CacheConfig {
+    /// The namespace and credential for one job: `(prefix, Secret name)`.
+    fn namespace(&self, trusted_git: bool) -> (String, &str) {
+        if trusted_git {
+            (format!("{}git/", self.key_prefix), &self.secret_git_rw)
+        } else {
+            (
+                format!("{}uploads/", self.key_prefix),
+                &self.secret_uploads_rw,
+            )
+        }
+    }
 }
 
 /// The sandbox client's configuration. Built from env in a pod, from a lookup in tests.
@@ -314,10 +332,13 @@ impl SandboxConfig {
         };
 
         // An unset bucket is the off switch: the Pod then carries no cache environment at all.
+        // With a bucket set, the endpoint is REQUIRED — this repository is public, so it must not
+        // carry a private address as a default, and a missing endpoint is a deploy-time error
+        // (CrashLoop), never a Pod that silently cannot reach its cache.
         let cache = match get(SCCACHE_BUCKET_ENV) {
             Some(bucket) => {
-                let endpoint = get(SCCACHE_ENDPOINT_ENV)
-                    .unwrap_or_else(|| DEFAULT_SCCACHE_ENDPOINT.to_owned());
+                let endpoint =
+                    get(SCCACHE_ENDPOINT_ENV).ok_or(SandboxError::Missing(SCCACHE_ENDPOINT_ENV))?;
                 if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
                     return Err(SandboxError::Invalid {
                         name: SCCACHE_ENDPOINT_ENV,
@@ -335,18 +356,24 @@ impl SandboxConfig {
                         });
                     }
                 };
+                let prefix = get(SCCACHE_KEY_PREFIX_ENV)
+                    .unwrap_or_else(|| DEFAULT_SCCACHE_KEY_PREFIX.to_owned());
+                let prefix = if prefix.ends_with('/') {
+                    prefix
+                } else {
+                    format!("{prefix}/")
+                };
                 Some(CacheConfig {
                     bucket,
                     endpoint,
                     region: get(SCCACHE_REGION_ENV)
                         .unwrap_or_else(|| DEFAULT_SCCACHE_REGION.to_owned()),
                     use_ssl,
-                    key_prefix: get(SCCACHE_KEY_PREFIX_ENV)
-                        .unwrap_or_else(|| DEFAULT_SCCACHE_KEY_PREFIX.to_owned()),
-                    secret_rw: get(SCCACHE_SECRET_RW_ENV)
-                        .unwrap_or_else(|| DEFAULT_SCCACHE_SECRET_RW.to_owned()),
-                    secret_ro: get(SCCACHE_SECRET_RO_ENV)
-                        .unwrap_or_else(|| DEFAULT_SCCACHE_SECRET_RO.to_owned()),
+                    key_prefix: prefix,
+                    secret_git_rw: get(SCCACHE_SECRET_GIT_RW_ENV)
+                        .unwrap_or_else(|| DEFAULT_SCCACHE_SECRET_GIT_RW.to_owned()),
+                    secret_uploads_rw: get(SCCACHE_SECRET_UPLOADS_RW_ENV)
+                        .unwrap_or_else(|| DEFAULT_SCCACHE_SECRET_UPLOADS_RW.to_owned()),
                     write_repos: repos_from(get(SCCACHE_WRITE_REPOS_ENV).as_deref()),
                 })
             }
@@ -669,18 +696,15 @@ impl Sandbox {
     /// The cache environment for one job, or nothing when the cache is disabled.
     ///
     /// Every name is the one `.github/workflows/rust-library.yml` already uses for the CI cache,
-    /// so one sccache dialect serves both. The credential is a `secretKeyRef` with
+    /// so one sccache dialect serves both. The job's namespace — `git/` or `uploads/` — decides
+    /// both the object prefix and which write credential is referenced, and the reference is
     /// `optional: true`: a missing Secret leaves the variable unset and the build runs uncached,
     /// which is the only failure mode a gate may have.
     fn cache_env(&self, spec_json: &Value) -> Vec<Value> {
         let Some(cache) = self.config.cache.as_ref() else {
             return Vec::new();
         };
-        let secret = if self.cache_writer(spec_json) {
-            &cache.secret_rw
-        } else {
-            &cache.secret_ro
-        };
+        let (prefix, secret) = cache.namespace(self.cache_trusted_git(spec_json));
         let reference = |env_name: &str, secret_key: &str| {
             json!({
                 "name": env_name,
@@ -697,7 +721,7 @@ impl Sandbox {
             json!({ "name": "SCCACHE_ENDPOINT", "value": &cache.endpoint }),
             json!({ "name": "SCCACHE_REGION", "value": &cache.region }),
             json!({ "name": "SCCACHE_S3_USE_SSL", "value": use_ssl }),
-            json!({ "name": "SCCACHE_S3_KEY_PREFIX", "value": &cache.key_prefix }),
+            json!({ "name": "SCCACHE_S3_KEY_PREFIX", "value": prefix }),
             json!({ "name": "SCCACHE_IDLE_TIMEOUT", "value": "0" }),
             json!({ "name": "SCCACHE_LOG", "value": "warn" }),
             json!({ "name": "AWS_EC2_METADATA_DISABLED", "value": "true" }),
@@ -706,13 +730,14 @@ impl Sandbox {
         ]
     }
 
-    /// Whether this job may WRITE the shared cache.
+    /// Whether this job belongs in the **trusted git** namespace.
     ///
     /// A Pod holding a write key can PUT arbitrary objects regardless of how sccache derives its
-    /// own keys, so write access is granted only when every source is a git repository on the
-    /// allowlist — a repository code cannot enter without push access. Anything else (uploaded
-    /// source, inline files, an unlisted URL) reads the cache and never writes it.
-    fn cache_writer(&self, spec_json: &Value) -> bool {
+    /// own keys, so the git namespace is reserved for jobs whose every source is a git repository
+    /// on the allowlist — a repository code cannot enter without push access. Anything else
+    /// (uploaded working trees, inline files, a fork's URL) uses the uploads namespace, whose
+    /// credential cannot write the git subtree at all.
+    fn cache_trusted_git(&self, spec_json: &Value) -> bool {
         let Some(cache) = self.config.cache.as_ref() else {
             return false;
         };

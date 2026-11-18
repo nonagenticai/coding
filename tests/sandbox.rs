@@ -342,16 +342,16 @@ fn manifest_is_restricted_and_carries_the_spec() {
 }
 
 #[test]
-fn cache_environment_is_read_only_unless_every_source_is_an_allowlisted_git_repo() {
+fn cache_namespaces_separate_trusted_git_from_uploaded_source() {
     let mut cfg = config("http://127.0.0.1:1");
     cfg.cache = Some(coding::sandbox::CacheConfig {
         bucket: "ci-sccache".to_owned(),
-        endpoint: coding::sandbox::DEFAULT_SCCACHE_ENDPOINT.to_owned(),
+        endpoint: "http://127.0.0.1:9000".to_owned(),
         region: coding::sandbox::DEFAULT_SCCACHE_REGION.to_owned(),
         use_ssl: false,
         key_prefix: "coding/".to_owned(),
-        secret_rw: "coding-sccache-rw".to_owned(),
-        secret_ro: "coding-sccache-ro".to_owned(),
+        secret_git_rw: "coding-sccache-git-rw".to_owned(),
+        secret_uploads_rw: "coding-sccache-uploads-rw".to_owned(),
         write_repos: vec!["https://github.com/nonagenticai/coding".to_owned()],
     });
     let sandbox = Sandbox::new(cfg).expect("client");
@@ -377,16 +377,20 @@ fn cache_environment_is_read_only_unless_every_source_is_an_allowlisted_git_repo
             .to_owned()
     };
 
-    // Uploaded source is untrusted: read the cache, never write it.
+    // The commit gate uploads the working tree: it gets the uploads namespace, whose credential
+    // cannot write the git subtree. This is the namespace that makes a warm pre-commit possible.
     let upload = env_of(json!({
         "deadline_seconds": 60,
         "input": { "source": { "kind": "upload", "id": "abc" } }
     }));
-    assert_eq!(creds(&upload), "coding-sccache-ro");
+    assert_eq!(creds(&upload), "coding-sccache-uploads-rw");
     let reference = find(&upload, "AWS_ACCESS_KEY_ID");
     assert_eq!(reference["valueFrom"]["secretKeyRef"]["key"], "access_key");
     assert_eq!(reference["valueFrom"]["secretKeyRef"]["optional"], true);
-    assert_eq!(find(&upload, "SCCACHE_S3_KEY_PREFIX")["value"], "coding/");
+    assert_eq!(
+        find(&upload, "SCCACHE_S3_KEY_PREFIX")["value"],
+        "coding/uploads/"
+    );
     assert_eq!(find(&upload, "SCCACHE_BUCKET")["value"], "ci-sccache");
     // The credential is a reference; no key ever rides in the manifest.
     assert!(
@@ -394,14 +398,16 @@ fn cache_environment_is_read_only_unless_every_source_is_an_allowlisted_git_repo
         "the value is never in the spec"
     );
 
-    // An allowlisted git repository may write — the `.git` spelling must not miss the allowlist.
+    // An allowlisted git repository uses the git namespace — the `.git` spelling must not miss
+    // the allowlist, and the two namespaces must never share a prefix.
     let git = env_of(json!({
         "deadline_seconds": 60,
         "input": { "source": { "kind": "git", "url": "https://github.com/nonagenticai/coding.git", "ref": "main" } }
     }));
-    assert_eq!(creds(&git), "coding-sccache-rw");
+    assert_eq!(creds(&git), "coding-sccache-git-rw");
+    assert_eq!(find(&git, "SCCACHE_S3_KEY_PREFIX")["value"], "coding/git/");
 
-    // One untrusted source is enough to take write access away from the whole job.
+    // One untrusted source is enough to take the whole job out of the git namespace.
     let mixed = env_of(json!({
         "deadline_seconds": 60,
         "input": {
@@ -413,14 +419,14 @@ fn cache_environment_is_read_only_unless_every_source_is_an_allowlisted_git_repo
             ]
         }
     }));
-    assert_eq!(creds(&mixed), "coding-sccache-ro");
+    assert_eq!(creds(&mixed), "coding-sccache-uploads-rw");
 
-    // A git repository outside the allowlist reads too.
+    // A git repository outside the allowlist — a fork, say — is not trusted either.
     let foreign = env_of(json!({
         "deadline_seconds": 60,
         "input": { "source": { "kind": "git", "url": "https://github.com/someone/else", "ref": "main" } }
     }));
-    assert_eq!(creds(&foreign), "coding-sccache-ro");
+    assert_eq!(creds(&foreign), "coding-sccache-uploads-rw");
 
     // Cache disabled: the Pod carries no wrapper at all, so a plain build is all it can do.
     let plain = Sandbox::new(config("http://127.0.0.1:1")).expect("client");
@@ -459,25 +465,36 @@ fn cache_config_defaults_and_normalises_the_write_allowlist() {
         ("SANDBOX_API_URL", "http://127.0.0.1:1"),
         ("SANDBOX_TOKEN", "test-token"),
         ("CODING_SCCACHE_BUCKET", "ci-sccache"),
+        ("CODING_SCCACHE_ENDPOINT", "http://127.0.0.1:9000"),
     ];
     let mut pairs = base.to_vec();
     pairs.push((
         "CODING_SCCACHE_WRITE_REPOS",
         "https://github.com/o/a.git, https://github.com/o/b/",
     ));
+    pairs.push(("CODING_SCCACHE_KEY_PREFIX", "coding"));
     let cache = build(&pairs).expect("config").cache.expect("cache");
-    assert_eq!(cache.endpoint, coding::sandbox::DEFAULT_SCCACHE_ENDPOINT);
+    assert_eq!(cache.endpoint, "http://127.0.0.1:9000");
     assert_eq!(cache.region, coding::sandbox::DEFAULT_SCCACHE_REGION);
     assert!(!cache.use_ssl, "a plaintext endpoint is not TLS");
-    assert_eq!(cache.secret_rw, "coding-sccache-rw");
+    assert_eq!(cache.key_prefix, "coding/", "the prefix always ends in /");
+    assert_eq!(cache.secret_git_rw, "coding-sccache-git-rw");
+    assert_eq!(cache.secret_uploads_rw, "coding-sccache-uploads-rw");
     assert_eq!(
         cache.write_repos,
         vec!["https://github.com/o/a", "https://github.com/o/b"]
     );
 
-    // An unset bucket is the off switch.
+    // An unset bucket is the off switch — and then no endpoint is needed either.
     let none = build(&base[..4]).expect("config");
     assert!(none.cache.is_none());
+
+    // A bucket without an endpoint is a deploy-time error, not a Pod that silently cannot reach
+    // its cache (this repository is public; no private address is baked in).
+    assert!(
+        build(&base[..5]).is_err(),
+        "an endpoint is required with a bucket"
+    );
 
     // A typo in the boolean is a startup failure, not a silently misleading client.
     let mut broken = base.to_vec();
