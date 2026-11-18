@@ -56,7 +56,7 @@ The tree decides the toolchain; there is no language-specific job kind.
 | profile | detected by | the `check` plan |
 |---|---|---|
 | `rust` | `Cargo.toml` + `Cargo.lock` | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked` |
-| `python` | `pyproject.toml` + `uv.lock` | `uv lock --check`, `uv sync --all-extras --locked`, `ruff check`, `ruff format --check`, `ty check`, `pytest -v --tb=short` |
+| `python` | `pyproject.toml` + `uv.lock` | `uv lock --check`, `uv sync --all-extras --locked`, `ruff check`, `ruff format --check`, `ty check src`, `pytest -v --tb=short` |
 
 `--profile auto` (the default) detects the profile from the packed tree; a repository carrying
 both toolchains must choose with `--profile rust|python`, and a tree without either pair is a
@@ -65,10 +65,12 @@ omitted from the request for it, so a Rust job sends exactly the body it sent be
 existed. The runner checks the same marker again against the materialised tree and answers
 `unsupported` (exit 2), never a failing check.
 
-The Python plan mirrors the estate's Python CI command for command, so the gate's verdict is the
-one CI would give. Two limits today: the image carries CPython 3.14 only (a repository pinning
-another version fails with uv's own message), and `--kind build` is `unsupported` for Python
-because the Python archetype has no build gate to mirror.
+The Python plan mirrors the estate's Python CI command for command — including `ty check src`, the
+archetype's scope: checking the whole project reports diagnostics in `tests/` that CI never sees,
+and a gate stricter than CI blocks a push CI would accept. Two limits today: the image carries
+CPython 3.14 only (a repository pinning another version fails with uv's own message), and
+`--kind build` is `unsupported` for Python because the Python archetype has no build gate to
+mirror.
 
 The worker runs up to `CODING_WORKER_CONCURRENCY` jobs at once (default 4). Every claim carries
 its own fencing token, so a slot that lost its lease can never heartbeat, complete, fail or

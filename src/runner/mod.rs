@@ -180,9 +180,11 @@ const PYTHON_LINT: &[Planned] = &[
     Planned {
         name: "ty check",
         program: "uv",
-        // No path: the archetype's `src` default does not exist in a flat layout, and the gate
-        // must not fail on "path does not exist" for a repository CI would accept.
-        args: &["run", "ty", "check"],
+        // `src` — the archetype's default scope, mirroring CI. Measured 2026-11-18 on a real
+        // estate repository: a whole-project `ty check` reported 18 diagnostics that all live in
+        // `tests/` and that CI (which checks `src`) never sees. A gate stricter than CI blocks a
+        // push of code CI would accept, which is the one failure a gate must not have.
+        args: &["run", "ty", "check", "src"],
         needs_database: false,
         needs_redis: false,
     },
@@ -245,7 +247,7 @@ const PYTHON_CHECK: &[Planned] = &[
     Planned {
         name: "ty check",
         program: "uv",
-        args: &["run", "ty", "check"],
+        args: &["run", "ty", "check", "src"],
         needs_database: false,
         needs_redis: false,
     },
@@ -416,7 +418,7 @@ mod tests {
                         ".",
                     ][..],
                 ),
-                ("uv", &["run", "ty", "check"][..]),
+                ("uv", &["run", "ty", "check", "src"][..]),
             ]
         );
         let test = plan(Profile::Python, JobKind::Test).expect("test");

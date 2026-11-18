@@ -6,6 +6,13 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- The Python profile's `ty` step checks `src` (the archetype's scope), not the whole project. A
+  whole-project check reports diagnostics in `tests/` that CI never sees and blocked a push the
+  estate's CI would accept.
+
+
 ### Added
 
 - Language profiles: a job names the toolchain (`rust` or `python`) in its input, and the runner
