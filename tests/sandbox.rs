@@ -712,7 +712,7 @@ async fn every_named_upload_source_is_prepared_with_its_own_capability() {
     let result = execute_sandbox(
         &sandbox,
         &pool,
-        Some("http://coding.coding.svc.cluster.local:8687"),
+        Some("http://coding.example.test:8687"),
         None,
         claim,
     )
