@@ -141,6 +141,7 @@ fn config(api_url: &str) -> SandboxConfig {
             coding::domain::Profile::Rust,
             coding::domain::Profile::Python,
         ],
+        multi_source: true,
         runtime_class: "coding-kata".to_owned(),
         api_url: api_url.to_owned(),
         token: "test-token".to_owned(),
@@ -585,7 +586,9 @@ async fn state_reports_the_success_exit_code() {
 }
 
 #[tokio::test]
-async fn succeeded_without_a_result_line_reports_the_exit_code_and_log_tail() {
+async fn succeeded_without_a_result_line_is_a_runner_failure_not_a_pass() {
+    // A Pod that exits 0 without the runner's verdict is not evidence about the code. The old
+    // fallback invented `{"exit":"succeeded"}`, which a gate read as green.
     let stub = stub(StubInner {
         pod: Some(json!({
             "status": {
@@ -600,13 +603,12 @@ async fn succeeded_without_a_result_line_reports_the_exit_code_and_log_tail() {
     });
     let sandbox = sandbox_for(&stub).await;
 
-    let result = run_job(&sandbox, claim("job-1", JobKind::Test, 30))
+    let error = run_job(&sandbox, claim("job-1", JobKind::Test, 30))
         .await
-        .expect("a succeeded pod is a job success");
-    assert_eq!(
-        result,
-        json!({ "exit": "succeeded", "exit_code": 0, "log_tail": "build ok\n" })
-    );
+        .expect_err("no verdict line is not a pass");
+    assert_eq!(error.code, "runner_failed");
+    assert!(!error.retryable);
+    assert_eq!(error.details, Some(json!("build ok\n")));
 }
 
 #[tokio::test]

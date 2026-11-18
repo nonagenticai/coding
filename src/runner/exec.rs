@@ -23,8 +23,11 @@ use crate::runner::result::{
 };
 use crate::runner::spec::RunnerSpec;
 
-/// Where an inline source is written and a git source is cloned. Inside the Pod this is the
-/// writable `emptyDir` mounted at `/tmp`.
+/// The work base. Inside the Pod this is the writable `emptyDir` mounted at `/tmp`; every source
+/// and every scratch file lives under it.
+pub const WORK_DIR: &str = "/tmp";
+/// Where a single-source job's tree is written. Unchanged, so a job that names one source runs
+/// exactly as it did before multi-source existed.
 pub const SOURCE_DIR: &str = "/tmp/src";
 /// The most stderr text carried into an error message.
 const MAX_ERROR_TEXT: usize = 2048;
@@ -82,84 +85,158 @@ enum Mode {
 
 /// Run a job. Always returns a result; a crash is the only way to get no result line.
 pub async fn run(spec: &RunnerSpec, cancel: &mut Cancellation) -> RunnerResult {
-    run_in(spec, cancel, Path::new(SOURCE_DIR)).await
+    run_in(spec, cancel, Path::new(WORK_DIR)).await
 }
 
-/// [`run`] against an explicit work directory. Tests use this; the Pod uses [`SOURCE_DIR`].
-pub async fn run_in(
-    spec: &RunnerSpec,
-    cancel: &mut Cancellation,
-    source_dir: &Path,
-) -> RunnerResult {
-    let Some(planned) = plan(spec.input.profile, spec.kind) else {
-        return RunnerResult::new(
-            Status::Unsupported,
-            format!(
-                "kind {} is not implemented for profile {} by this runner",
-                spec.kind.as_str(),
-                spec.input.profile.as_str()
-            ),
-        );
-    };
+/// One source to check, with the name it reports under (multi-source only) and its own profile.
+struct Unit<'a> {
+    name: Option<&'a str>,
+    profile: Profile,
+    source: Option<&'a Source>,
+    dir: PathBuf,
+}
+
+/// The units of a job: one unnamed source at `<work>/src`, or every named source at
+/// `<work>/sources/<name>`. Names and count were validated by the API and again by [`RunnerSpec`];
+/// this only maps them onto the filesystem.
+fn units<'a>(spec: &'a RunnerSpec, work_dir: &Path) -> Vec<Unit<'a>> {
+    if spec.input.sources.is_empty() {
+        return vec![Unit {
+            name: None,
+            profile: spec.input.profile,
+            source: spec.input.source.as_ref(),
+            dir: work_dir.join("src"),
+        }];
+    }
+    spec.input
+        .sources
+        .iter()
+        .map(|named| Unit {
+            name: Some(named.name.as_str()),
+            profile: named.profile,
+            source: Some(&named.source),
+            dir: work_dir.join("sources").join(&named.name),
+        })
+        .collect()
+}
+
+/// Put the (possibly partial) source summaries on the result, in the shape the caller used: a
+/// single-source job reports `source`, a multi-source job `sources`. Called before a failure
+/// return too, so the result of a job that died while materialising source 2 still names source 1.
+fn attach_sources(result: &mut RunnerResult, multi: bool, infos: &mut [Option<SourceInfo>]) {
+    if multi {
+        result.sources = infos.iter_mut().filter_map(Option::take).collect();
+    } else {
+        result.source = infos.first_mut().and_then(Option::take);
+    }
+}
+
+/// [`run`] against an explicit work base. Tests use this; the Pod uses [`WORK_DIR`].
+pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Path) -> RunnerResult {
+    let units = units(spec, work_dir);
+    // Every unit must have a plan before anything is cloned or started: a job that would check
+    // two sources and cannot check one of them is answered before it burns a clone or a database.
+    for unit in &units {
+        if plan(unit.profile, spec.kind).is_none() {
+            return RunnerResult::new(
+                Status::Unsupported,
+                match unit.name {
+                    Some(name) => format!(
+                        "kind {} is not implemented for profile {} by this runner (source {name:?})",
+                        spec.kind.as_str(),
+                        unit.profile.as_str()
+                    ),
+                    None => format!(
+                        "kind {} is not implemented for profile {} by this runner",
+                        spec.kind.as_str(),
+                        unit.profile.as_str()
+                    ),
+                },
+            );
+        }
+    }
 
     let deadline = TokioInstant::now() + std::time::Duration::from_secs(spec.deadline_seconds);
-    let source = spec.input.source.as_ref();
-    let source_info = source.map(|source| SourceInfo {
-        kind: match source {
-            Source::Inline { .. } => "inline".to_owned(),
-            Source::Git { .. } => "git".to_owned(),
-            Source::Upload { .. } => "upload".to_owned(),
-        },
-        files: crate::runner::spec::file_count(source),
-        commit: None,
-    });
+    let multi = !spec.input.sources.is_empty();
+    let mut infos: Vec<Option<SourceInfo>> = units
+        .iter()
+        .map(|unit| {
+            unit.source.map(|source| SourceInfo {
+                name: unit.name.map(str::to_owned),
+                kind: match source {
+                    Source::Inline { .. } => "inline".to_owned(),
+                    Source::Git { .. } => "git".to_owned(),
+                    Source::Upload { .. } => "upload".to_owned(),
+                },
+                files: crate::runner::spec::file_count(source),
+                commit: None,
+            })
+        })
+        .collect();
 
     println!(
-        "== coding-runner {} job={} kind={} deadline={}s ==",
+        "== coding-runner {} job={} kind={} deadline={}s{} ==",
         env!("CARGO_PKG_VERSION"),
         spec.job_id,
         spec.kind.as_str(),
         spec.deadline_seconds,
+        if multi {
+            format!(" sources={}", units.len())
+        } else {
+            String::new()
+        },
     );
 
-    let materialised = match source {
-        Some(source) => {
-            match materialise(
-                source,
-                source_dir,
-                &target_dir_for(source_dir),
-                deadline,
-                cancel,
-            )
-            .await
-            {
-                Ok(materialised) => materialised,
-                Err(failure) => return failure.into_result(source_info),
+    let mut result = RunnerResult::new(Status::Succeeded, String::new());
+    for (index, unit) in units.iter().enumerate() {
+        let Some(source) = unit.source else {
+            continue;
+        };
+        match materialise(
+            source,
+            &unit.dir,
+            &target_dir_for(&unit.dir),
+            deadline,
+            cancel,
+        )
+        .await
+        {
+            Ok(materialised) => {
+                if let Some(info) = infos[index].as_mut() {
+                    info.commit = materialised.commit;
+                    if let Some(files) = materialised.files {
+                        info.files = files;
+                    }
+                }
+            }
+            Err(failure) => {
+                attach_sources(&mut result, multi, &mut infos);
+                return failure.into_result(result, unit.name);
             }
         }
-        None => Materialised::default(),
-    };
-    let source_info = source_info.map(|mut info| {
-        info.commit = materialised.commit;
-        if let Some(files) = materialised.files {
-            info.files = files;
+    }
+    attach_sources(&mut result, multi, &mut infos);
+
+    // Each source's profile is the caller's claim about that tree. A tree without the profile's
+    // marker is a mismatch, not a failing check: running cargo in a Python tree (or uv in a Rust
+    // one) fails for a reason that says nothing about the repository. The API checked the same
+    // shape, and this process checks it again because the spec arrives through a Pod env var.
+    for unit in &units {
+        let marker = unit.profile.marker_file();
+        if unit.dir.join(marker).is_file() {
+            continue;
         }
-        info
-    });
-
-    let mut result = RunnerResult::new(Status::Succeeded, String::new()).with_source(source_info);
-
-    // The profile is the caller's claim about the tree. A tree without the profile's marker is a
-    // mismatch, not a failing check: running cargo in a Python tree (or uv in a Rust one) fails
-    // for a reason that says nothing about the repository. The API checked the same shape, and
-    // this process checks it again because the spec arrives through a Pod env var.
-    let marker = spec.input.profile.marker_file();
-    if !source_dir.join(marker).is_file() {
         result.status = Status::Unsupported;
-        result.summary = format!(
-            "profile {} expects {marker} at the root of the source; it is not there",
-            spec.input.profile.as_str()
-        );
+        result.summary = match unit.name {
+            Some(name) => format!(
+                "profile {} expects {marker} at the root of source {name:?}; it is not there",
+                unit.profile.as_str()
+            ),
+            None => format!(
+                "profile {} expects {marker} at the root of the source; it is not there",
+                unit.profile.as_str()
+            ),
+        };
         return result;
     }
 
@@ -179,7 +256,7 @@ pub async fn run_in(
         // URL instead of colliding with the job's cluster on port 5432 and its data directory.
         println!("== postgres: using the database this process was given ({url})");
     }
-    let mut database = Database::new(source_dir.parent().unwrap_or(source_dir), exported);
+    let mut database = Database::new(work_dir, exported);
     if crate::runner::needs_database(spec.kind) && !database.available() {
         // No cluster possible on this host (a developer's Mac, or the control-plane image): run
         // the plan as it ran before this module existed, and say so rather than fail.
@@ -196,18 +273,11 @@ pub async fn run_in(
     if let Some(url) = exported_private_redis.as_deref() {
         println!("== redis: using the private server this process was given ({url})");
     }
-    let mut redis = Redis::new(
-        source_dir.parent().unwrap_or(source_dir),
-        exported_redis,
-        exported_private_redis,
-    );
+    let mut redis = Redis::new(work_dir, exported_redis, exported_private_redis);
     if crate::runner::needs_redis(spec.kind) && !redis.available() {
         println!("== redis: not installed on this host; running without TEST_REDIS_URL/REDIS_URL");
     }
 
-    // A per-run target dir beside the source: deterministic, and never the shell's own
-    // CARGO_TARGET_DIR (which in CI points at the outer build).
-    let target_dir = target_dir_for(source_dir);
     let mut database_url: Option<String> = None;
     // The same database in the spelling the estate's Python suites read (SQLAlchemy + psycopg).
     let mut database_alias: Option<String> = None;
@@ -215,266 +285,283 @@ pub async fn run_in(
     // The port the started Redis actually listens on, for the Python suite's REDIS_HOST/REDIS_PORT.
     let mut redis_port: Option<String> = None;
     let mut private_redis_url: Option<String> = None;
-    for step in planned {
-        // A step is attempted twice **only** when the database died under it. The first attempt's
-        // death is printed with its log tail, so the retry hides nothing; a second death is the
-        // job's error. The measured failure (a cluster that vanished while the test step was still
-        // compiling) is exactly the case this recovers from: the re-run finds the build done and
-        // a fresh cluster listening.
-        let mut attempt: u32 = 0;
-        let mut duration_ms = 0u64;
-        'attempt: loop {
-            attempt += 1;
-            if step.needs_database && database.available() {
-                match database.ensure().await {
-                    Ok(url) => {
-                        // Printed on purpose: the URL carries no secret (trust auth, a throwaway
-                        // cluster), and when a test reports "Connection refused" the first
-                        // question is always *which* database it was told to use.
-                        println!(
-                            "== postgres: `{}` gets TEST_DATABASE_URL={url} accepting={}",
-                            step.name,
-                            crate::runner::postgres::accepting_connections().await
-                        );
-                        database_alias = Some(sqlalchemy_dsn(&url));
-                        database_url = Some(url);
-                    }
-                    Err(error) => {
-                        result.status = Status::Failed;
-                        result.summary = "the throwaway Postgres is not usable".to_owned();
-                        result.error = Some(error);
-                        return result;
-                    }
-                }
-            }
-            if step.needs_redis && redis.available() {
-                match redis.ensure().await {
-                    Ok(url) => {
-                        // Probe the port the URL actually names: the CI exports a dind Redis on a
-                        // random host port, and dialling 6379 would report a healthy server as
-                        // unreachable.
-                        let port = crate::runner::redis::port_of(&url)
-                            .unwrap_or(crate::runner::redis::PORT);
-                        println!(
-                            "== redis: `{}` gets TEST_REDIS_URL={url} accepting={}",
-                            step.name,
-                            crate::runner::redis::accepting_connections(port).await
-                        );
-                        redis_port = Some(port.to_string());
-                        redis_url = Some(url);
-                    }
-                    Err(error) => {
-                        result.status = Status::Failed;
-                        result.summary = "the throwaway Redis is not usable".to_owned();
-                        result.error = Some(error);
-                        return result;
-                    }
-                }
-                let can_private = redis.can_start_private();
-                match redis.ensure_private().await {
-                    Ok(url) => {
-                        println!(
-                            "== redis: `{}` gets TEST_REDIS_PRIVATE_URL={url}",
-                            step.name
-                        );
-                        private_redis_url = Some(url);
-                    }
-                    // The private server exists for one test shape (a FLUSHALL that must not touch
-                    // its siblings). A host without `redis-server` — the control-plane image, a
-                    // developer's Mac, the CI runner — runs the step without it; a test that needs
-                    // it reports its own failure. Only a host that CAN provide one and fails is a
-                    // setup error.
-                    Err(error) if can_private => {
-                        result.status = Status::Failed;
-                        result.summary = "the private throwaway Redis is not usable".to_owned();
-                        result.error = Some(error);
-                        return result;
-                    }
-                    Err(error) => println!(
-                        "== redis: no private server on this host ({error}); running without \
-                         TEST_REDIS_PRIVATE_URL"
-                    ),
-                }
-            }
-            // Only a step that needs a service is told about it: a build script must not probe an
-            // address whose server has not started.
-            let python = spec.input.profile == Profile::Python;
-            let env: Vec<(&str, &str)> = {
-                let mut env = Vec::new();
-                if python {
-                    // The runner image's Python is read-only and preinstalled; every writable
-                    // path a job needs is under the /tmp scratch the sandbox mounts, and
-                    // downloads are off so uv cannot fetch a CPython into that scratch per job.
-                    env.push(("HOME", "/tmp"));
-                    env.push(("UV_CACHE_DIR", "/tmp/uv-cache"));
-                    env.push(("UV_PYTHON_INSTALL_DIR", crate::runner::PYTHON_INSTALL_DIR));
-                    env.push(("UV_PYTHON_DOWNLOADS", "never"));
-                }
-                if let (true, Some(url)) = (step.needs_database, database_url.as_deref()) {
-                    env.push(("TEST_DATABASE_URL", url));
-                    if python {
-                        // The same server in the estate's Python spelling: SQLAlchemy names the
-                        // driver, and the driver is psycopg v3 (`postgresql+psycopg://`).
-                        if let Some(alias) = database_alias.as_deref() {
-                            env.push(("DATABASE_URL", alias));
+    // One plan per source, in the order the job declared them. The throwaway Postgres and Redis
+    // are the job's, not a source's: they start lazily at the first step anywhere that needs one
+    // and every later step of every later source reuses them.
+    for unit in &units {
+        // Checked for every unit before a Pod ran anything; a `None` here cannot happen, and is
+        // skipped rather than unwrapped because a panic costs the job its result line.
+        let Some(planned) = plan(unit.profile, spec.kind) else {
+            continue;
+        };
+        // A per-source target dir beside its tree: deterministic, and never the shell's own
+        // CARGO_TARGET_DIR (which in CI points at the outer build). Two Rust sources must not
+        // share one, or their builds would race in one directory.
+        let target_dir = target_dir_for(&unit.dir);
+        let python = unit.profile == Profile::Python;
+        for step in planned {
+            // A step is attempted twice **only** when the database died under it. The first attempt's
+            // death is printed with its log tail, so the retry hides nothing; a second death is the
+            // job's error. The measured failure (a cluster that vanished while the test step was still
+            // compiling) is exactly the case this recovers from: the re-run finds the build done and
+            // a fresh cluster listening.
+            let mut attempt: u32 = 0;
+            let mut duration_ms = 0u64;
+            'attempt: loop {
+                attempt += 1;
+                if step.needs_database && database.available() {
+                    match database.ensure().await {
+                        Ok(url) => {
+                            // Printed on purpose: the URL carries no secret (trust auth, a throwaway
+                            // cluster), and when a test reports "Connection refused" the first
+                            // question is always *which* database it was told to use.
+                            println!(
+                                "== postgres: `{}` gets TEST_DATABASE_URL={url} accepting={}",
+                                step.name,
+                                crate::runner::postgres::accepting_connections().await
+                            );
+                            database_alias = Some(sqlalchemy_dsn(&url));
+                            database_url = Some(url);
                         }
-                    }
-                }
-                if let (true, Some(url)) = (step.needs_redis, redis_url.as_deref()) {
-                    env.push(("TEST_REDIS_URL", url));
-                    env.push(("REDIS_URL", url));
-                    if python {
-                        // The estate's Python services read the host/port pair, not a URL.
-                        env.push(("REDIS_HOST", "127.0.0.1"));
-                        env.push(("REDIS_PORT", redis_port.as_deref().unwrap_or("6379")));
-                    }
-                }
-                if let (true, Some(url)) = (step.needs_redis, private_redis_url.as_deref()) {
-                    env.push(("TEST_REDIS_PRIVATE_URL", url));
-                }
-                env
-            };
-            let started = TokioInstant::now();
-            let outcome = run_child(
-                Mode::Stream,
-                step.program,
-                step.args,
-                &ChildCtx {
-                    dir: source_dir,
-                    target_dir: &target_dir,
-                    env: env.as_slice(),
-                },
-                deadline,
-                cancel,
-            )
-            .await;
-            duration_ms += started.elapsed().as_millis() as u64;
-            let outcome = match outcome {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    result.status = Status::Failed;
-                    result.error = Some(format!("{} could not start: {err}", step.name));
-                    result.summary = format!("{} could not start", step.name);
-                    return result;
-                }
-            };
-            match outcome.stop {
-                Stop::Exited(code) => {
-                    let failed = code != Some(0);
-                    // A step that needed a database and failed while nothing was listening is an
-                    // infrastructure failure, not a verdict about the repository. The probe
-                    // decides, never the child's exit code: a test can fail for its own reasons
-                    // while the server is healthy, and that failure must still be reported as one.
-                    //
-                    // `is_ours()` is part of the test, for two reasons. On a host with no Postgres
-                    // binaries this runner deliberately runs the plan without a database, and a
-                    // test that fails there is the repository's business. On a database the
-                    // environment provided, the probe below (which dials 127.0.0.1:5432) would be
-                    // asking about a different server than the one the step used — so only a
-                    // cluster this process started can be judged dead.
-                    if failed
-                        && step.needs_database
-                        && database.is_ours()
-                        && !crate::runner::postgres::accepting_connections().await
-                    {
-                        let death = database.died(step.name);
-                        println!("== postgres: {death}");
-                        if attempt >= SERVICE_ATTEMPTS {
+                        Err(error) => {
                             result.status = Status::Failed;
-                            result.summary =
-                                format!("the throwaway Postgres died during {}", step.name);
-                            result.error = Some(death);
+                            result.summary = "the throwaway Postgres is not usable".to_owned();
+                            result.error = Some(error);
                             return result;
                         }
-                        match database.restart().await {
-                            Ok(()) => {
-                                println!(
-                                    "== postgres: restarted; re-running `{}` (attempt {} of \
-                                     {SERVICE_ATTEMPTS})",
-                                    step.name,
-                                    attempt + 1
-                                );
-                                continue 'attempt;
+                    }
+                }
+                if step.needs_redis && redis.available() {
+                    match redis.ensure().await {
+                        Ok(url) => {
+                            // Probe the port the URL actually names: the CI exports a dind Redis on a
+                            // random host port, and dialling 6379 would report a healthy server as
+                            // unreachable.
+                            let port = crate::runner::redis::port_of(&url)
+                                .unwrap_or(crate::runner::redis::PORT);
+                            println!(
+                                "== redis: `{}` gets TEST_REDIS_URL={url} accepting={}",
+                                step.name,
+                                crate::runner::redis::accepting_connections(port).await
+                            );
+                            redis_port = Some(port.to_string());
+                            redis_url = Some(url);
+                        }
+                        Err(error) => {
+                            result.status = Status::Failed;
+                            result.summary = "the throwaway Redis is not usable".to_owned();
+                            result.error = Some(error);
+                            return result;
+                        }
+                    }
+                    let can_private = redis.can_start_private();
+                    match redis.ensure_private().await {
+                        Ok(url) => {
+                            println!(
+                                "== redis: `{}` gets TEST_REDIS_PRIVATE_URL={url}",
+                                step.name
+                            );
+                            private_redis_url = Some(url);
+                        }
+                        // The private server exists for one test shape (a FLUSHALL that must not touch
+                        // its siblings). A host without `redis-server` — the control-plane image, a
+                        // developer's Mac, the CI runner — runs the step without it; a test that needs
+                        // it reports its own failure. Only a host that CAN provide one and fails is a
+                        // setup error.
+                        Err(error) if can_private => {
+                            result.status = Status::Failed;
+                            result.summary = "the private throwaway Redis is not usable".to_owned();
+                            result.error = Some(error);
+                            return result;
+                        }
+                        Err(error) => println!(
+                            "== redis: no private server on this host ({error}); running without \
+                         TEST_REDIS_PRIVATE_URL"
+                        ),
+                    }
+                }
+                // Only a step that needs a service is told about it: a build script must not probe an
+                // address whose server has not started.
+                let env: Vec<(&str, &str)> = {
+                    let mut env = Vec::new();
+                    if python {
+                        // The runner image's Python is read-only and preinstalled; every writable
+                        // path a job needs is under the /tmp scratch the sandbox mounts, and
+                        // downloads are off so uv cannot fetch a CPython into that scratch per job.
+                        env.push(("HOME", "/tmp"));
+                        env.push(("UV_CACHE_DIR", "/tmp/uv-cache"));
+                        env.push(("UV_PYTHON_INSTALL_DIR", crate::runner::PYTHON_INSTALL_DIR));
+                        env.push(("UV_PYTHON_DOWNLOADS", "never"));
+                    }
+                    if let (true, Some(url)) = (step.needs_database, database_url.as_deref()) {
+                        env.push(("TEST_DATABASE_URL", url));
+                        if python {
+                            // The same server in the estate's Python spelling: SQLAlchemy names the
+                            // driver, and the driver is psycopg v3 (`postgresql+psycopg://`).
+                            if let Some(alias) = database_alias.as_deref() {
+                                env.push(("DATABASE_URL", alias));
                             }
-                            Err(error) => {
+                        }
+                    }
+                    if let (true, Some(url)) = (step.needs_redis, redis_url.as_deref()) {
+                        env.push(("TEST_REDIS_URL", url));
+                        env.push(("REDIS_URL", url));
+                        if python {
+                            // The estate's Python services read the host/port pair, not a URL.
+                            env.push(("REDIS_HOST", "127.0.0.1"));
+                            env.push(("REDIS_PORT", redis_port.as_deref().unwrap_or("6379")));
+                        }
+                    }
+                    if let (true, Some(url)) = (step.needs_redis, private_redis_url.as_deref()) {
+                        env.push(("TEST_REDIS_PRIVATE_URL", url));
+                    }
+                    env
+                };
+                let started = TokioInstant::now();
+                let outcome = run_child(
+                    Mode::Stream,
+                    step.program,
+                    step.args,
+                    &ChildCtx {
+                        dir: &unit.dir,
+                        target_dir: &target_dir,
+                        env: env.as_slice(),
+                    },
+                    deadline,
+                    cancel,
+                )
+                .await;
+                duration_ms += started.elapsed().as_millis() as u64;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(err) => {
+                        result.status = Status::Failed;
+                        result.error = Some(format!("{} could not start: {err}", step.name));
+                        result.summary = format!("{} could not start", step.name);
+                        return result;
+                    }
+                };
+                match outcome.stop {
+                    Stop::Exited(code) => {
+                        let failed = code != Some(0);
+                        // A step that needed a database and failed while nothing was listening is an
+                        // infrastructure failure, not a verdict about the repository. The probe
+                        // decides, never the child's exit code: a test can fail for its own reasons
+                        // while the server is healthy, and that failure must still be reported as one.
+                        //
+                        // `is_ours()` is part of the test, for two reasons. On a host with no Postgres
+                        // binaries this runner deliberately runs the plan without a database, and a
+                        // test that fails there is the repository's business. On a database the
+                        // environment provided, the probe below (which dials 127.0.0.1:5432) would be
+                        // asking about a different server than the one the step used — so only a
+                        // cluster this process started can be judged dead.
+                        if failed
+                            && step.needs_database
+                            && database.is_ours()
+                            && !crate::runner::postgres::accepting_connections().await
+                        {
+                            let death = database.died(step.name);
+                            println!("== postgres: {death}");
+                            if attempt >= SERVICE_ATTEMPTS {
                                 result.status = Status::Failed;
                                 result.summary =
                                     format!("the throwaway Postgres died during {}", step.name);
-                                result.error = Some(format!("{death}\n{error}"));
+                                result.error = Some(death);
                                 return result;
                             }
-                        }
-                    }
-                    // The same classification for Redis: a step that failed while the server this
-                    // process started is not listening is infrastructure, not a verdict about the
-                    // repository. An exported URL is never judged or restarted — it is not ours.
-                    let redis_dead = redis.is_ours()
-                        && !crate::runner::redis::accepting_connections(crate::runner::redis::PORT)
-                            .await;
-                    let private_redis_dead = redis.private_is_ours()
-                        && !crate::runner::redis::accepting_connections(
-                            crate::runner::redis::PRIVATE_PORT,
-                        )
-                        .await;
-                    if failed && step.needs_redis && (redis_dead || private_redis_dead) {
-                        let death = redis.died(step.name);
-                        println!("== redis: {death}");
-                        if attempt >= SERVICE_ATTEMPTS {
-                            result.status = Status::Failed;
-                            result.summary =
-                                format!("the throwaway Redis died during {}", step.name);
-                            result.error = Some(death);
-                            return result;
-                        }
-                        match redis.restart().await {
-                            Ok(()) => {
-                                println!(
-                                    "== redis: restarted; re-running `{}` (attempt {} of \
+                            match database.restart().await {
+                                Ok(()) => {
+                                    println!(
+                                        "== postgres: restarted; re-running `{}` (attempt {} of \
                                      {SERVICE_ATTEMPTS})",
-                                    step.name,
-                                    attempt + 1
-                                );
-                                continue 'attempt;
+                                        step.name,
+                                        attempt + 1
+                                    );
+                                    continue 'attempt;
+                                }
+                                Err(error) => {
+                                    result.status = Status::Failed;
+                                    result.summary =
+                                        format!("the throwaway Postgres died during {}", step.name);
+                                    result.error = Some(format!("{death}\n{error}"));
+                                    return result;
+                                }
                             }
-                            Err(error) => {
+                        }
+                        // The same classification for Redis: a step that failed while the server this
+                        // process started is not listening is infrastructure, not a verdict about the
+                        // repository. An exported URL is never judged or restarted — it is not ours.
+                        let redis_dead = redis.is_ours()
+                            && !crate::runner::redis::accepting_connections(
+                                crate::runner::redis::PORT,
+                            )
+                            .await;
+                        let private_redis_dead = redis.private_is_ours()
+                            && !crate::runner::redis::accepting_connections(
+                                crate::runner::redis::PRIVATE_PORT,
+                            )
+                            .await;
+                        if failed && step.needs_redis && (redis_dead || private_redis_dead) {
+                            let death = redis.died(step.name);
+                            println!("== redis: {death}");
+                            if attempt >= SERVICE_ATTEMPTS {
                                 result.status = Status::Failed;
                                 result.summary =
                                     format!("the throwaway Redis died during {}", step.name);
-                                result.error = Some(format!("{death}\n{error}"));
+                                result.error = Some(death);
                                 return result;
                             }
+                            match redis.restart().await {
+                                Ok(()) => {
+                                    println!(
+                                        "== redis: restarted; re-running `{}` (attempt {} of \
+                                     {SERVICE_ATTEMPTS})",
+                                        step.name,
+                                        attempt + 1
+                                    );
+                                    continue 'attempt;
+                                }
+                                Err(error) => {
+                                    result.status = Status::Failed;
+                                    result.summary =
+                                        format!("the throwaway Redis died during {}", step.name);
+                                    result.error = Some(format!("{death}\n{error}"));
+                                    return result;
+                                }
+                            }
                         }
-                    }
-                    let status = if failed {
-                        CheckStatus::Failed
-                    } else {
-                        CheckStatus::Passed
-                    };
-                    result.checks.push(Check {
-                        name: step.name.to_owned(),
-                        status,
-                        exit_code: code,
-                        duration_ms,
-                        output_tail: if failed {
-                            Some(outcome.tail.clone()).filter(|tail| !tail.is_empty())
+                        let status = if failed {
+                            CheckStatus::Failed
                         } else {
-                            None
-                        },
-                    });
-                    break 'attempt;
-                }
-                Stop::TimedOut => {
-                    result.status = Status::Timeout;
-                    result.summary = format!(
-                        "the job deadline of {}s was exceeded during {}",
-                        spec.deadline_seconds, step.name
-                    );
-                    return result;
-                }
-                Stop::Cancelled => {
-                    result.status = Status::Cancelled;
-                    result.summary = "the job was cancelled while running".to_owned();
-                    return result;
+                            CheckStatus::Passed
+                        };
+                        result.checks.push(Check {
+                            source: unit.name.map(str::to_owned),
+                            name: step.name.to_owned(),
+                            status,
+                            exit_code: code,
+                            duration_ms,
+                            output_tail: if failed {
+                                Some(outcome.tail.clone()).filter(|tail| !tail.is_empty())
+                            } else {
+                                None
+                            },
+                        });
+                        break 'attempt;
+                    }
+                    Stop::TimedOut => {
+                        result.status = Status::Timeout;
+                        result.summary = format!(
+                            "the job deadline of {}s was exceeded during {}",
+                            spec.deadline_seconds, step.name
+                        );
+                        return result;
+                    }
+                    Stop::Cancelled => {
+                        result.status = Status::Cancelled;
+                        result.summary = "the job was cancelled while running".to_owned();
+                        return result;
+                    }
                 }
             }
         }
@@ -495,14 +582,30 @@ pub async fn run_in(
 /// Derive the verdict and the human summary from the checks collected so far.
 fn finish(mut result: RunnerResult) -> RunnerResult {
     let total = result.checks.len();
-    let failed = result
+    let failing: Vec<&Check> = result
         .checks
         .iter()
         .filter(|check| check.status == CheckStatus::Failed)
-        .count();
-    if failed > 0 {
+        .collect();
+    if !failing.is_empty() {
         result.status = Status::Failed;
-        result.summary = format!("{failed} of {total} checks failed");
+        // Name the failing sources: with several plans in one Pod, "3 of 9 checks failed" does
+        // not tell a caller which tree to look at.
+        let names: Vec<&str> = failing
+            .iter()
+            .filter_map(|check| check.source.as_deref())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        result.summary = if names.is_empty() {
+            format!("{} of {total} checks failed", failing.len())
+        } else {
+            format!(
+                "{} of {total} checks failed ({})",
+                failing.len(),
+                names.join(", ")
+            )
+        };
     } else {
         result.status = Status::Succeeded;
         result.summary = format!("{total} of {total} checks passed");
@@ -806,15 +909,21 @@ struct Failure {
 }
 
 impl Failure {
-    fn into_result(self, source: Option<SourceInfo>) -> RunnerResult {
-        let status = match self.stop {
+    /// The result for a setup failure. `source_name` names which source could not be
+    /// materialised; a multi-source job must not report an anonymous setup failure.
+    fn into_result(self, mut result: RunnerResult, source_name: Option<&str>) -> RunnerResult {
+        result.status = match self.stop {
             Stop::TimedOut => Status::Timeout,
             Stop::Cancelled => Status::Cancelled,
             Stop::Exited(_) => Status::Failed,
         };
-        RunnerResult::new(status, self.message.clone())
-            .with_source(source)
-            .with_error(self.message)
+        let message = match source_name {
+            Some(name) => format!("source {name:?}: {}", self.message),
+            None => self.message,
+        };
+        result.summary = message.clone();
+        result.error = Some(message);
+        result
     }
 }
 

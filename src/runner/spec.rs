@@ -85,14 +85,63 @@ impl RunnerSpec {
                 "deadline_seconds must be between 1 and {MAX_DEADLINE_SECONDS}"
             )));
         }
-        match &self.input.source {
-            Some(source) => validate_source(source).map_err(SpecError::Invalid),
-            None if self.needs_source() => Err(SpecError::Invalid(format!(
-                "kind {:?} requires input.source",
-                self.kind.as_str()
-            ))),
-            None => Ok(()),
+        if self.input.source.is_some() && !self.input.sources.is_empty() {
+            return Err(SpecError::Invalid(
+                "input.source and input.sources are mutually exclusive".to_owned(),
+            ));
         }
+        if let Some(source) = &self.input.source {
+            return validate_source(source).map_err(SpecError::Invalid);
+        }
+        if !self.input.sources.is_empty() {
+            if !self.input.profile.is_rust() {
+                return Err(SpecError::Invalid(
+                    "input.profile must be omitted when input.sources is used".to_owned(),
+                ));
+            }
+            if self.input.sources.len() > crate::domain::MAX_SOURCES {
+                return Err(SpecError::Invalid(format!(
+                    "input.sources carries {} sources, over the {}-source cap",
+                    self.input.sources.len(),
+                    crate::domain::MAX_SOURCES
+                )));
+            }
+            let mut names: Vec<&str> = Vec::with_capacity(self.input.sources.len());
+            let mut inline_total = 0usize;
+            for named in &self.input.sources {
+                if !crate::domain::valid_source_name(&named.name) {
+                    return Err(SpecError::Invalid(format!(
+                        "source name {:?} is not a lowercase path component",
+                        named.name
+                    )));
+                }
+                if names.contains(&named.name.as_str()) {
+                    return Err(SpecError::Invalid(format!(
+                        "input.sources repeats the name {:?}",
+                        named.name
+                    )));
+                }
+                names.push(named.name.as_str());
+                validate_source(&named.source).map_err(SpecError::Invalid)?;
+                if let Source::Inline { files } = &named.source {
+                    inline_total = inline_total
+                        .saturating_add(files.iter().map(|file| file.text.len()).sum::<usize>());
+                }
+            }
+            if inline_total > MAX_INLINE_BYTES {
+                return Err(SpecError::Invalid(format!(
+                    "inline sources total {inline_total} bytes, over the {MAX_INLINE_BYTES}-byte cap"
+                )));
+            }
+            return Ok(());
+        }
+        if self.needs_source() {
+            return Err(SpecError::Invalid(format!(
+                "kind {:?} requires input.source or input.sources",
+                self.kind.as_str()
+            )));
+        }
+        Ok(())
     }
 
     /// Kinds that cannot run without code.

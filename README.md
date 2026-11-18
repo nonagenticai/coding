@@ -72,6 +72,37 @@ CPython 3.14 only (a repository pinning another version fails with uv's own mess
 `--kind build` is `unsupported` for Python because the Python archetype has no build gate to
 mirror.
 
+### Multi-source jobs (the unified run)
+
+A job may carry several **named** sources instead of one:
+
+```json
+{"kind": "check", "input": {"sources": [
+  {"name": "target",   "profile": "rust",   "source": {"kind": "git", "url": "https://github.com/o/target-rs", "ref": "<sha>"}},
+  {"name": "source-1", "profile": "python", "source": {"kind": "git", "url": "https://github.com/o/source-py", "ref": "<sha>"}}
+]}}
+```
+
+Each source is materialised at `/tmp/sources/<name>` (a single-source job keeps `/tmp/src`) and
+its profile's plan runs against it, in the declared order, in the **same Pod and against the same
+throwaway PostgreSQL/Redis**. That is how the rewrite gate's "pytest against the sources and the
+target's tests on the same diff" is one run instead of two jobs that can disagree.
+
+- 1–8 sources; names match `^[a-z][a-z0-9-]{0,31}$` and are unique.
+- `input.source` and `input.sources` are mutually exclusive, and with `sources` the job-level
+  `input.profile` must be omitted: each named source carries its own profile, and the runner
+  re-checks each tree's marker before any step runs (`unsupported`, exit 2).
+- Every check names its source (`checks[].source`), and the result lists `sources[]`
+  (`name`, `kind`, `files`, `commit`); a single-source job keeps exactly its old result shape.
+- The inline-text cap (48 KiB) is summed across sources, and the serialised input is bounded so
+  the Pod's 64 KiB spec env can never overflow. A multi-source job can take longer than one plan:
+  raise `timeout_seconds` when it does.
+
+The worker refuses a `sources` job **before a Pod exists** when the pinned runner image predates
+support (`CODING_RUNNER_MULTI_SOURCE` unset or not affirmative) and refuses any source whose
+profile is not listed in `CODING_RUNNER_PROFILES` — so a mixed rollout fails with a legible
+message rather than an `invalid job spec` from the Pod.
+
 The worker runs up to `CODING_WORKER_CONCURRENCY` jobs at once (default 4). Every claim carries
 its own fencing token, so a slot that lost its lease can never heartbeat, complete, fail or
 cancel the job a newer claim owns, and a slot that panics cannot leave its lease renewing;

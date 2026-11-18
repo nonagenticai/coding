@@ -624,7 +624,18 @@ pub async fn reap_sources(pool: &PgPool, older_than_seconds: i64) -> Result<u64,
           AND NOT EXISTS (
               SELECT 1 FROM jobs j
               WHERE j.status IN ('queued', 'running')
-                AND j.input->'source'->>'id' = s.id::text
+                AND (
+                    -- The single-source form.
+                    j.input->'source'->>'id' = s.id::text
+                    -- The multi-source form: every entry's own source object.
+                    OR EXISTS (
+                        SELECT 1
+                        FROM jsonb_array_elements(
+                                 COALESCE(j.input->'sources', '[]'::jsonb)
+                             ) AS entry
+                        WHERE entry->'source'->>'id' = s.id::text
+                    )
+                )
           )
         "#,
     )

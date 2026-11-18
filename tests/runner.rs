@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use coding::domain::{InlineFile, JobInput, JobKind, Source};
+use coding::domain::{InlineFile, JobInput, JobKind, NamedSource, Profile, Source};
 use coding::runner::exec::{self, Cancellation};
 use coding::runner::result::Status;
 use coding::runner::spec::RunnerSpec;
@@ -209,6 +209,97 @@ async fn a_failing_check_carries_its_output_tail() {
     );
 }
 
+fn sources_spec(kind: JobKind, list: &[(&str, Profile, Source)]) -> RunnerSpec {
+    let mut spec = spec(kind, None);
+    spec.input.sources = list
+        .iter()
+        .map(|(name, profile, source)| NamedSource {
+            name: (*name).to_owned(),
+            profile: *profile,
+            source: source.clone(),
+        })
+        .collect();
+    spec
+}
+
+/// One job, two trees: both plans run, and every check says which tree it belongs to.
+#[tokio::test]
+async fn a_two_source_job_runs_both_plans_and_names_each_check() {
+    let work = WorkDir::new("two-sources");
+    let mut cancel = Cancellation::new().expect("signal handler");
+    let result = exec::run_in(
+        &sources_spec(
+            JobKind::Test,
+            &[
+                ("target", Profile::Rust, crate_source(false)),
+                ("source-1", Profile::Rust, crate_source(true)),
+            ],
+        ),
+        &mut cancel,
+        work.source(),
+    )
+    .await;
+
+    assert_eq!(result.status, Status::Failed, "{result:?}");
+    assert_eq!(result.checks.len(), 2, "one test step per source");
+    assert_eq!(result.checks[0].source.as_deref(), Some("target"));
+    assert_eq!(result.checks[1].source.as_deref(), Some("source-1"));
+    assert_eq!(
+        result.checks[0].status,
+        coding::runner::result::CheckStatus::Passed
+    );
+    assert_eq!(
+        result.checks[1].status,
+        coding::runner::result::CheckStatus::Failed
+    );
+    // Both plans ran: the second source's failure did not stop the job from reporting the first.
+    assert!(
+        result.summary.contains("source-1"),
+        "the summary names the failing source: {}",
+        result.summary
+    );
+    // The single-source fields stay out of a multi-source result.
+    assert!(result.source.is_none());
+    let names: Vec<&str> = result
+        .sources
+        .iter()
+        .filter_map(|source| source.name.as_deref())
+        .collect();
+    assert_eq!(names, ["target", "source-1"]);
+    // Each tree was materialised under its own name.
+    assert!(work.source().join("sources/target/Cargo.toml").is_file());
+    assert!(work.source().join("sources/source-1/Cargo.toml").is_file());
+}
+
+/// A source whose tree is not its profile's is refused before any plan runs: an unset marker is
+/// a request mistake, not a failing check about the code.
+#[tokio::test]
+async fn a_second_source_without_its_marker_is_unsupported_before_any_step() {
+    let work = WorkDir::new("second-marker");
+    let mut cancel = Cancellation::new().expect("signal handler");
+    let result = exec::run_in(
+        &sources_spec(
+            JobKind::Check,
+            &[
+                ("target", Profile::Rust, crate_source(false)),
+                // No pyproject.toml: the python profile cannot run on this tree.
+                ("source-1", Profile::Python, crate_source(false)),
+            ],
+        ),
+        &mut cancel,
+        work.source(),
+    )
+    .await;
+
+    assert_eq!(result.status, Status::Unsupported, "{result:?}");
+    assert!(result.checks.is_empty(), "nothing ran: {result:?}");
+    assert!(
+        result.summary.contains("source-1") && result.summary.contains("pyproject.toml"),
+        "the verdict names the source and the missing marker: {}",
+        result.summary
+    );
+}
+
 /// The upload source's fetch address, as only the worker will supply it.
 const UPLOAD_ID: &str = "6f1a1f6a-1d3a-4f2c-9a1e-2f4a1b7c8d90";
 const UPLOAD_TOKEN: &str = "0123456789abcdef0123456789abcdef";
@@ -291,7 +382,8 @@ async fn an_uploaded_archive_is_fetched_verified_and_unpacked() {
     let source = result.source.expect("a result names its source");
     assert_eq!(source.kind, "upload");
     assert_eq!(source.files, 3, "the archive's own file count");
-    let unpacked = std::fs::read_to_string(work.source().join("src/lib.rs")).expect("unpacked");
+    // A single-source job's tree lands at `<work base>/src`, exactly where the Pod writes it.
+    let unpacked = std::fs::read_to_string(work.source().join("src/src/lib.rs")).expect("unpacked");
     assert!(
         unpacked.contains("pub fn add"),
         "the working tree came out of the archive: {unpacked}"

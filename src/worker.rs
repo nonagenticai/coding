@@ -147,35 +147,85 @@ pub fn sandbox_executor(
     })
 }
 
-/// Resolve the source a job names into the source the Pod will see.
+/// Resolve every source a job names into the source the Pod will see.
 ///
 /// Only an uploaded archive needs anything done here: the id is turned into a fetch URL, a
 /// capability token minted for this attempt, and the archive's sha256 for the Pod to verify.
-/// Everything the request supplied is preserved, and nothing is fetched by this process.
+/// A github.com clone gets the App's installation token (the App caches it, so several sources
+/// cost one mint). Everything the request supplied is preserved, and nothing is fetched here.
 async fn prepare_input(
     pool: &PgPool,
     api_url: Option<&str>,
     github_app: Option<&GitHubApp>,
     claim: &JobClaim,
 ) -> Result<Value, JobError> {
-    let Some(source) = claim.input.get("source") else {
-        return Ok(claim.input.clone());
-    };
-    match source.get("kind").and_then(Value::as_str) {
-        Some("upload") => {}
-        Some("git") => return prepare_git_input(github_app, claim, source).await,
-        _ => return Ok(claim.input.clone()),
+    let mut input = claim.input.clone();
+
+    // The pre-multi-source form: one source, prepared exactly as it always was.
+    if let Some(source) = input.get("source").cloned() {
+        let mut source = source;
+        prepare_source(pool, api_url, github_app, claim, &mut source).await?;
+        input["source"] = source;
     }
+
+    // The multi-source form: every entry's own `source`, each prepared the same way.
+    if let Some(sources) = input.get("sources").and_then(Value::as_array).cloned() {
+        let mut prepared = Vec::with_capacity(sources.len());
+        for entry in sources {
+            let mut entry = entry;
+            if let Some(source) = entry.get("source").cloned() {
+                let mut source = source;
+                prepare_source(pool, api_url, github_app, claim, &mut source).await?;
+                entry["source"] = source;
+            }
+            prepared.push(entry);
+        }
+        input["sources"] = Value::Array(prepared);
+    }
+    Ok(input)
+}
+
+/// Give one source whatever only the server can supply: an upload's fetch URL, capability token
+/// and hash, or a github.com clone's installation token.
+async fn prepare_source(
+    pool: &PgPool,
+    api_url: Option<&str>,
+    github_app: Option<&GitHubApp>,
+    claim: &JobClaim,
+    source: &mut Value,
+) -> Result<(), JobError> {
+    match source.get("kind").and_then(Value::as_str) {
+        Some("upload") => prepare_upload_source(pool, api_url, claim, source).await,
+        Some("git") => {
+            if let Some(token) = git_token(github_app, source).await?
+                && let Some(object) = source.as_object_mut()
+            {
+                object.insert("token".to_owned(), Value::String(token));
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Turn an uploaded source's id into the URL, capability token and hash the Pod fetches.
+async fn prepare_upload_source(
+    pool: &PgPool,
+    api_url: Option<&str>,
+    claim: &JobClaim,
+    source: &mut Value,
+) -> Result<(), JobError> {
     let id = source
         .get("id")
         .and_then(Value::as_str)
-        .ok_or_else(|| invalid_spec("an upload source must name its id".to_owned()))?;
+        .ok_or_else(|| invalid_spec("an upload source must name its id".to_owned()))?
+        .to_owned();
     let Some(base) = api_url else {
         return Err(invalid_spec(format!(
             "{API_URL_ENV} is not set, so an uploaded source cannot be fetched"
         )));
     };
-    let minted = store::mint_source_token(pool, &claim.tenant_id, &claim.id, id).await;
+    let minted = store::mint_source_token(pool, &claim.tenant_id, &claim.id, &id).await;
     let (token, sha256) = match minted {
         Ok(Some(minted)) => minted,
         Ok(None) => {
@@ -192,40 +242,36 @@ async fn prepare_input(
             });
         }
     };
-    let mut input = claim.input.clone();
-    if let Some(object) = input.get_mut("source").and_then(Value::as_object_mut) {
-        object.insert(
-            "url".to_owned(),
-            Value::String(format!(
-                "{}/api/sources/{id}/blob",
-                base.trim_end_matches('/')
-            )),
-        );
-        object.insert("token".to_owned(), Value::String(token));
-        object.insert("sha256".to_owned(), Value::String(sha256));
-    }
-    Ok(input)
+    let Some(object) = source.as_object_mut() else {
+        return Err(invalid_spec("an upload source is not an object".to_owned()));
+    };
+    object.insert(
+        "url".to_owned(),
+        Value::String(format!(
+            "{}/api/sources/{id}/blob",
+            base.trim_end_matches('/')
+        )),
+    );
+    object.insert("token".to_owned(), Value::String(token));
+    object.insert("sha256".to_owned(), Value::String(sha256));
+    Ok(())
 }
 
-/// Give a github.com clone an installation token minted by the estate's GitHub App.
+/// The installation token for a github.com clone, if there is one to give.
 ///
-/// A URL that is not github.com is returned untouched: the token is a credential, and the request
-/// chooses the URL. No App configured (or no token needed) leaves the clone anonymous, exactly as
-/// before GitHub support existed.
-async fn prepare_git_input(
+/// A URL that is not github.com gets nothing: the token is a credential, and the request chooses
+/// the URL. No App configured (or no token needed) leaves the clone anonymous, exactly as before
+/// GitHub support existed. The App caches the token (50 min), so a job with several github
+/// sources mints once.
+async fn git_token(
     github_app: Option<&GitHubApp>,
-    claim: &JobClaim,
     source: &Value,
-) -> Result<Value, JobError> {
+) -> Result<Option<String>, JobError> {
     let Some(app) = github_app else {
-        return Ok(claim.input.clone());
+        return Ok(None);
     };
-    let url = source
-        .get("url")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if !crate::github_app::is_github_url(url) {
-        return Ok(claim.input.clone());
+    if !is_github_git(source) {
+        return Ok(None);
     }
     let token = app.installation_token().await.map_err(|message| JobError {
         code: "github_app_error".to_owned(),
@@ -233,11 +279,18 @@ async fn prepare_git_input(
         details: None,
         retryable: true,
     })?;
-    let mut input = claim.input.clone();
-    if let Some(object) = input.get_mut("source").and_then(Value::as_object_mut) {
-        object.insert("token".to_owned(), Value::String(token));
-    }
-    Ok(input)
+    Ok(Some(token))
+}
+
+/// Whether a source is a github.com git clone: the only kind a token may be sent to.
+fn is_github_git(source: &Value) -> bool {
+    source.get("kind").and_then(Value::as_str) == Some("git")
+        && crate::github_app::is_github_url(
+            source
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        )
 }
 
 /// A spec the server itself cannot satisfy. Permanent: retrying changes nothing.
@@ -336,7 +389,19 @@ async fn poll_pod(
                     exit_code = ?exit_code,
                     "sandbox: runner pod succeeded"
                 );
-                return Ok(result_from_log(&log, exit_code));
+                return match result_from_log(&log, exit_code) {
+                    Ok(result) => Ok(result),
+                    Err(reason) => Err(JobError {
+                        code: "runner_failed".to_owned(),
+                        message: reason,
+                        details: if log.is_empty() {
+                            None
+                        } else {
+                            Some(Value::String(log))
+                        },
+                        retryable: false,
+                    }),
+                };
             }
             Ok(PodState::Failed { reason }) => {
                 let log = read_log(sandbox, pod).await;
@@ -387,10 +452,13 @@ async fn read_log(sandbox: &Sandbox, pod: &str) -> String {
     }
 }
 
-/// The job result. The runner's last NDJSON `{"coding_result": ...}` line wins; otherwise the
-/// result is explicit about what it is — an exit status, the container's exit code, and the
-/// bounded log tail.
-fn result_from_log(log: &str, exit_code: Option<i32>) -> Value {
+/// The job result: the runner's `{"coding_result": …}` line, wherever it sits in the log.
+///
+/// A Pod that exited 0 without that line is NOT a pass. The runner writes the line whenever it
+/// finishes, so its absence means the line was lost — a log read too small for it, or a process
+/// that is not the runner — and the old fallback (`{"exit":"succeeded"}`) reported exactly that
+/// as a green job. A gate that passes when its verdict is missing is worse than no gate.
+fn result_from_log(log: &str, exit_code: Option<i32>) -> Result<Value, String> {
     for line in log.lines().rev() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -399,10 +467,14 @@ fn result_from_log(log: &str, exit_code: Option<i32>) -> Value {
         if let Ok(Value::Object(object)) = serde_json::from_str::<Value>(trimmed)
             && let Some(result) = object.get("coding_result")
         {
-            return result.clone();
+            return Ok(result.clone());
         }
     }
-    json!({ "exit": "succeeded", "exit_code": exit_code, "log_tail": log })
+    Err(format!(
+        "the runner pod exited {} without writing a result line; the log tail is in the job's \
+         error details",
+        exit_code.map_or_else(|| "0".to_owned(), |code| code.to_string())
+    ))
 }
 
 /// Map a sandbox failure onto the job envelope. Manifest and configuration errors are
@@ -412,7 +484,8 @@ fn sandbox_job_error(error: SandboxError) -> JobError {
         SandboxError::Missing(_)
         | SandboxError::Invalid { .. }
         | SandboxError::Credential(_)
-        | SandboxError::ProfileNotEnabled { .. } => ("sandbox_not_configured", false),
+        | SandboxError::ProfileNotEnabled { .. }
+        | SandboxError::SourcesNotEnabled => ("sandbox_not_configured", false),
         SandboxError::Manifest(_) | SandboxError::SpecTooLarge { .. } => {
             ("invalid_job_spec", false)
         }
@@ -840,15 +913,15 @@ mod tests {
         let api = github_api("ghs_from_the_app").await;
         let app = GitHubApp::with_signer("2333879", "12345678", &api, |_| Ok(vec![1u8; 256]));
         let claim = claim_with(json!({"kind": "git", "url": "https://github.com/o/r.git"}));
-        let input = prepare_git_input(Some(&app), &claim, &claim.input["source"])
+        let token = git_token(Some(&app), &claim.input["source"])
             .await
             .expect("mints");
-        assert_eq!(input["source"]["token"], "ghs_from_the_app");
+        assert_eq!(token.as_deref(), Some("ghs_from_the_app"));
         // The mint is cached: a second job does not call the API again.
-        let again = prepare_git_input(Some(&app), &claim, &claim.input["source"])
+        let again = git_token(Some(&app), &claim.input["source"])
             .await
             .expect("cached");
-        assert_eq!(again["source"]["token"], "ghs_from_the_app");
+        assert_eq!(again.as_deref(), Some("ghs_from_the_app"));
     }
 
     #[tokio::test]
@@ -861,22 +934,54 @@ mod tests {
             "https://github.com.evil.example/o/r.git",
         ] {
             let claim = claim_with(json!({"kind": "git", "url": url}));
-            let input = prepare_git_input(Some(&app), &claim, &claim.input["source"])
+            let token = git_token(Some(&app), &claim.input["source"])
                 .await
                 .expect("passes through");
-            assert!(
-                input["source"].get("token").is_none(),
-                "{url} must not receive a token"
-            );
+            assert!(token.is_none(), "{url} must not receive a token");
         }
     }
 
     #[tokio::test]
     async fn no_app_means_an_anonymous_clone_not_a_failure() {
         let claim = claim_with(json!({"kind": "git", "url": "https://github.com/o/r.git"}));
-        let input = prepare_git_input(None, &claim, &claim.input["source"])
+        let token = git_token(None, &claim.input["source"])
             .await
             .expect("unchanged");
-        assert_eq!(input, claim.input);
+        assert!(token.is_none());
+    }
+
+    #[tokio::test]
+    async fn every_named_github_source_gets_the_same_installation_token() {
+        let api = github_api("ghs_from_the_app").await;
+        let app = GitHubApp::with_signer("2333879", "12345678", &api, |_| Ok(vec![1u8; 256]));
+        // `claim_with` wraps its argument as the single `source`; this job's input is the
+        // multi-source form, so the claim is built and its input replaced.
+        let mut claim = claim_with(json!({"kind": "git", "url": "https://github.com/o/unused"}));
+        claim.input = json!({"sources": [
+            {"name": "target", "profile": "rust",
+             "source": {"kind": "git", "url": "https://github.com/o/target-rs"}},
+            {"name": "source-1", "profile": "python",
+             "source": {"kind": "git", "url": "https://github.com/o/source-py"}},
+            {"name": "public", "profile": "rust",
+             "source": {"kind": "git", "url": "https://gitlab.com/o/other"}}
+        ]});
+        // The upload path needs a pool; this job has none, and a lazy pool never connects.
+        let pool = sqlx::PgPool::connect_lazy("postgres://postgres:postgres@127.0.0.1:1/x")
+            .expect("lazy pool");
+        let input = prepare_input(&pool, None, Some(&app), &claim)
+            .await
+            .expect("prepares");
+        assert_eq!(
+            input["sources"][0]["source"]["token"], "ghs_from_the_app",
+            "the target's clone is authorised"
+        );
+        assert_eq!(
+            input["sources"][1]["source"]["token"], "ghs_from_the_app",
+            "the pinned source's clone is authorised"
+        );
+        assert!(
+            input["sources"][2]["source"].get("token").is_none(),
+            "a request-chosen host never receives the token"
+        );
     }
 }

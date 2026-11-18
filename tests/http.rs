@@ -195,7 +195,7 @@ async fn create_job_without_a_source_is_400_for_test_lint_build() {
         assert_eq!(body["error"]["code"], "invalid_job_input", "{kind}: {body}");
         assert_eq!(
             body["error"]["message"],
-            format!("kind {kind} requires input.source")
+            format!("kind {kind} requires input.source or input.sources")
         );
         assert_eq!(body["error"]["retryable"], false);
     }
@@ -247,6 +247,53 @@ async fn create_job_with_an_oversize_inline_source_is_400() {
         body["error"]["message"],
         "inline source is 49153 bytes, over the 49152-byte cap"
     );
+}
+
+#[tokio::test]
+async fn create_job_with_both_source_forms_is_400() {
+    let resp = post_job(
+        state(),
+        "contract-tenant",
+        serde_json::json!({
+            "kind": "check",
+            "input": {
+                "source": {"kind": "git", "url": "https://github.com/o/one"},
+                "sources": [{"name": "target", "profile": "rust",
+                             "source": {"kind": "git", "url": "https://github.com/o/two"}}]
+            }
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert_eq!(body["error"]["code"], "invalid_job_input");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("mutually exclusive")),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn create_job_with_an_unsafe_source_name_is_400() {
+    for name in ["Target", "../target", "target/one", ""] {
+        let resp = post_job(
+            state(),
+            "contract-tenant",
+            serde_json::json!({
+                "kind": "check",
+                "input": {"sources": [
+                    {"name": name, "profile": "rust",
+                     "source": {"kind": "git", "url": "https://github.com/o/r"}}
+                ]}
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{name:?}");
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], "invalid_job_input", "{name:?}");
+    }
 }
 
 /// A tenant id unique to this process and run, so the DB-backed test cannot collide with another
@@ -318,6 +365,49 @@ async fn create_job_with_an_inline_source_is_202_and_stores_the_typed_input() {
         stored["source"]["files"][0]["text"],
         serde_json::Value::String("[package]\nname = \"x\"\n".to_owned())
     );
+
+    sqlx::query("DELETE FROM jobs WHERE tenant_id = $1")
+        .bind(&tenant)
+        .execute(&pool)
+        .await
+        .expect("cleanup");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn a_multi_source_job_is_202_and_stores_every_named_source() {
+    let (state, pool) = state_with_db().await;
+    let tenant = unique_tenant("http-sources");
+
+    let resp = post_job(
+        state,
+        &tenant,
+        serde_json::json!({
+            "kind": "check",
+            "input": {"sources": [
+                {"name": "target", "profile": "rust",
+                 "source": {"kind": "git", "url": "https://github.com/o/target-rs", "ref": "abc"}},
+                {"name": "source-1", "profile": "python",
+                 "source": {"kind": "git", "url": "https://github.com/o/source-py", "ref": "def"}}
+            ]}
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], "queued");
+
+    let stored: serde_json::Value =
+        sqlx::query_scalar("SELECT input FROM jobs WHERE tenant_id = $1")
+            .bind(&tenant)
+            .fetch_one(&pool)
+            .await
+            .expect("stored job");
+    assert!(stored.get("source").is_none());
+    assert_eq!(stored["sources"][0]["name"], "target");
+    assert_eq!(stored["sources"][0]["profile"], "rust");
+    assert_eq!(stored["sources"][1]["profile"], "python");
+    assert_eq!(stored["sources"][1]["source"]["ref"], "def");
 
     sqlx::query("DELETE FROM jobs WHERE tenant_id = $1")
         .bind(&tenant)
@@ -653,6 +743,8 @@ async fn the_source_reaper_deletes_only_unreferenced_old_uploads() {
 
     let stale = store(&pool, &tenant, 3).await;
     let referenced = store(&pool, &tenant, 3).await;
+    // The multi-source form references an upload through `sources[].source.id`, not `source.id`.
+    let referenced_multi = store(&pool, &tenant, 3).await;
     let fresh = store(&pool, &tenant, 0).await;
 
     // A queued job still wants its archive, however old it is.
@@ -665,13 +757,30 @@ async fn the_source_reaper_deletes_only_unreferenced_old_uploads() {
         }),
     )
     .await;
+    let _ = post_job(
+        state.clone(),
+        &tenant,
+        serde_json::json!({
+            "kind": "check",
+            "input": {"sources": [
+                {"name": "target", "profile": "rust",
+                 "source": {"kind": "upload", "id": referenced_multi}}
+            ]},
+        }),
+    )
+    .await;
 
     let reaped = coding::store::reap_sources(&pool, 2 * 60 * 60)
         .await
         .expect("reap");
     assert!(reaped >= 1, "the stale upload must be gone");
 
-    for (id, expected) in [(&stale, false), (&referenced, true), (&fresh, true)] {
+    for (id, expected) in [
+        (&stale, false),
+        (&referenced, true),
+        (&referenced_multi, true),
+        (&fresh, true),
+    ] {
         let present: Option<(i32,)> = sqlx::query_as("SELECT 1 FROM sources WHERE id = $1::uuid")
             .bind(id)
             .fetch_optional(&pool)
