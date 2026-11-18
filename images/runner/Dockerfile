@@ -45,6 +45,24 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
     cargo build --release --locked --bin coding-runner \
     && install -D -m 0755 target/release/coding-runner /out/coding-runner
 
+# sccache: the client side of the compilation cache. A static musl binary, fetched and
+# sha256-verified from the release's own asset exactly as `.github/workflows/rust-library.yml`
+# does, so the job cache and the CI cache speak one dialect (same bucket, different key prefix).
+FROM debian:12-slim AS sccache
+ARG SCCACHE_VERSION=v0.19.0
+# sha256 of sccache-v0.19.0-x86_64-unknown-linux-musl.tar.gz
+ARG SCCACHE_SHA256=aa73c7270c997894038c0d8f0d297865f57569e1687883322bc431713d4bb9dd
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+        -o /tmp/sccache.tar.gz \
+        "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+    && echo "${SCCACHE_SHA256}  /tmp/sccache.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/sccache.tar.gz -C /tmp \
+    && install -D -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /out/sccache
+
 # The runtime stage is `postgres:18` because the runner starts a throwaway Postgres 18 from it
 # (src/runner/postgres.rs). It has to be THIS base: those binaries are built for the image's
 # own Debian (trixie, ICU 76), and copying them onto a bookworm base fails on missing shared
@@ -78,6 +96,8 @@ COPY --from=build /opt/rustup /opt/rustup
 # toolchain lives in /opt/rustup and only the shims in /opt/cargo/bin are needed beside it.
 COPY --from=build /opt/cargo/bin /opt/cargo/bin
 COPY --from=build /out/coding-runner /usr/local/bin/coding-runner
+# The compilation cache's client. Its endpoint and credentials arrive per job, never from here.
+COPY --from=sccache /out/sccache /usr/local/bin/sccache
 
 # The Python profile's toolchain: uv (the public archetype's version) and one CPython it manages.
 # The interpreter is read-only here and `coding-runner` points uv at it
@@ -100,6 +120,7 @@ RUN /opt/cargo/bin/rustc --version \
     && initdb --version \
     && pg_ctl --version \
     && redis-server --version \
+    && sccache --version \
     && test -f /usr/share/postgresql/18/postgres.bki
 
 # No WORKDIR under a read-only root; the runner creates /tmp/src itself.

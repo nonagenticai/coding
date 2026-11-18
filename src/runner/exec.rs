@@ -19,7 +19,7 @@ use crate::runner::plan;
 use crate::runner::postgres;
 use crate::runner::redis;
 use crate::runner::result::{
-    Check, CheckStatus, MAX_CHECK_OUTPUT_BYTES, RunnerResult, SourceInfo, Status,
+    CacheStats, Check, CheckStatus, MAX_CHECK_OUTPUT_BYTES, RunnerResult, SourceInfo, Status,
 };
 use crate::runner::spec::RunnerSpec;
 
@@ -587,6 +587,16 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
     }
     if let Some(diagnostics) = redis.diagnostics() {
         println!("{diagnostics}");
+    }
+
+    // Informational only: the verdict was decided by the checks above, and a cache that is
+    // unreachable, unconfigured or absent leaves this `None` rather than changing the result.
+    if let Some(stats) = sccache_stats() {
+        println!(
+            "sccache hits={} misses={} errors={}",
+            stats.hits, stats.misses, stats.errors
+        );
+        result.cache = Some(stats);
     }
 
     finish(result)
@@ -1284,6 +1294,71 @@ fn sqlalchemy_dsn(url: &str) -> String {
     }
 }
 
+/// Whether this image carries `sccache`. Answered once per process: a binary cannot appear
+/// midway through a job, and every child would otherwise pay for the check.
+fn sccache_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::process::Command::new("sccache")
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+    })
+}
+
+/// What sccache reports for this job, when it is present and its output parses.
+///
+/// Never an error: the cache cannot change a verdict, so every failure here is `None`.
+fn sccache_stats() -> Option<CacheStats> {
+    if !sccache_available() {
+        return None;
+    }
+    let output = std::process::Command::new("sccache")
+        .args(["--show-stats", "--stats-format=json"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sccache_stats(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse `sccache --show-stats --stats-format=json`.
+///
+/// The shape has moved between sccache releases — `cache_hits` has been a number and an object
+/// carrying per-language `counts` — so both are accepted, and anything else is `None` rather than
+/// a guessed number in a result a human will read.
+fn parse_sccache_stats(raw: &str) -> Option<CacheStats> {
+    let doc: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let stats = doc.get("stats").unwrap_or(&doc);
+    let hits = match stats.get("cache_hits")? {
+        serde_json::Value::Number(number) => number.as_u64()?,
+        serde_json::Value::Object(object) => object
+            .get("counts")?
+            .as_object()?
+            .values()
+            .filter_map(serde_json::Value::as_u64)
+            .sum(),
+        _ => return None,
+    };
+    Some(CacheStats {
+        hits,
+        misses: stats
+            .get("cache_misses")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        errors: stats
+            .get("cache_errors")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    })
+}
+
 /// Run one child under the job deadline and SIGTERM.
 async fn run_child(
     mode: Mode,
@@ -1302,6 +1377,12 @@ async fn run_child(
         .env("CARGO_TARGET_DIR", ctx.target_dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .kill_on_drop(true);
+    // A cache that cannot work must never fail a check. The Pod environment carries
+    // RUSTC_WRAPPER because the worker cannot know what the image contains; without the binary
+    // every rustc invocation would fail on the missing wrapper, so the runner drops it here.
+    if !sccache_available() {
+        command.env_remove("RUSTC_WRAPPER");
+    }
     for (key, value) in ctx.env {
         command.env(key, value);
     }
@@ -1445,6 +1526,33 @@ pub fn default_source_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_both_sccache_stats_shapes_and_refuses_a_guess() {
+        // sccache 0.19 reports per-language counts.
+        let counts = r#"{"stats":{"compile_requests":9,"cache_hits":{"counts":{"Rust":5,"C/C++":2}},"cache_misses":2,"cache_errors":1}}"#;
+        assert_eq!(
+            parse_sccache_stats(counts),
+            Some(CacheStats {
+                hits: 7,
+                misses: 2,
+                errors: 1
+            })
+        );
+        // Older releases reported a single number.
+        let number = r#"{"stats":{"cache_hits":4,"cache_misses":1}}"#;
+        assert_eq!(
+            parse_sccache_stats(number),
+            Some(CacheStats {
+                hits: 4,
+                misses: 1,
+                errors: 0
+            })
+        );
+        // Anything else is absent — never a guessed zero that reads like "the cache did nothing".
+        assert_eq!(parse_sccache_stats("not json"), None);
+        assert_eq!(parse_sccache_stats(r#"{"stats":{"unexpected":1}}"#), None);
+    }
 
     #[test]
     fn a_step_label_names_its_source_only_when_the_job_has_several() {
