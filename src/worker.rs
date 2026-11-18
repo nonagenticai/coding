@@ -409,9 +409,10 @@ fn result_from_log(log: &str, exit_code: Option<i32>) -> Value {
 /// permanent; transport and API failures may succeed on a retry.
 fn sandbox_job_error(error: SandboxError) -> JobError {
     let (code, retryable) = match &error {
-        SandboxError::Missing(_) | SandboxError::Invalid { .. } | SandboxError::Credential(_) => {
-            ("sandbox_not_configured", false)
-        }
+        SandboxError::Missing(_)
+        | SandboxError::Invalid { .. }
+        | SandboxError::Credential(_)
+        | SandboxError::ProfileNotEnabled { .. } => ("sandbox_not_configured", false),
         SandboxError::Manifest(_) | SandboxError::SpecTooLarge { .. } => {
             ("invalid_job_spec", false)
         }

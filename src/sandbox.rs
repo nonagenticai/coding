@@ -26,12 +26,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 
-use crate::domain::JobKind;
+use crate::domain::{JobKind, Profile};
 
 /// `CODING_RUNS_NAMESPACE`: the namespace runner Pods are created in. Required.
 pub const NAMESPACE_ENV: &str = "CODING_RUNS_NAMESPACE";
 /// `CODING_RUNNER_IMAGE`: the runner image, `image@sha256:<digest>`. Required.
 pub const RUNNER_IMAGE_ENV: &str = "CODING_RUNNER_IMAGE";
+/// `CODING_RUNNER_PROFILES`: the toolchain profiles the runner image carries, comma-separated.
+/// Unset means `rust`, the image's historical content. A job naming a profile that is not listed
+/// is refused before a Pod is created, so a deployment that has not been told about a profile
+/// fails with a message instead of an `invalid job spec` from an older runner.
+pub const PROFILES_ENV: &str = "CODING_RUNNER_PROFILES";
 /// `CODING_KATA_RUNTIME_CLASS`: the RuntimeClass that puts the Pod on the kata runtime.
 pub const RUNTIME_CLASS_ENV: &str = "CODING_KATA_RUNTIME_CLASS";
 /// `CODING_RUNS_PULL_SECRET`: the imagePullSecret in the runs namespace. The runner image is
@@ -114,6 +119,11 @@ pub enum SandboxError {
     /// The create response named a Pod other than the one we asked for.
     #[error("API returned pod {returned:?} for job {expected:?}")]
     ForeignPodName { expected: String, returned: String },
+    /// The job asks for a profile this worker's runner image was not configured to execute.
+    #[error(
+        "profile {requested:?} is not enabled on this worker (CODING_RUNNER_PROFILES={enabled:?})"
+    )]
+    ProfileNotEnabled { requested: String, enabled: String },
 }
 
 /// The sandbox client's configuration. Built from env in a pod, from a lookup in tests.
@@ -124,6 +134,9 @@ pub struct SandboxConfig {
     /// The digest-pinned runner image. One image for every kind at M1; per-kind overrides can
     /// be added without changing the wire contract because a payload can never name an image.
     pub runner_image: String,
+    /// The toolchain profiles that image can execute. `rust` unless `CODING_RUNNER_PROFILES`
+    /// says otherwise; a job asking for anything else is refused before a Pod exists.
+    pub profiles: Vec<Profile>,
     /// The RuntimeClass that selects the kata runtime.
     pub runtime_class: String,
     /// The API server base URL, e.g. `https://10.43.0.1:443`.
@@ -172,6 +185,7 @@ impl SandboxConfig {
 
         let runtime_class =
             get(RUNTIME_CLASS_ENV).unwrap_or_else(|| DEFAULT_RUNTIME_CLASS.to_owned());
+        let profiles = profiles_from(get(PROFILES_ENV).as_deref())?;
 
         let api_url = match get(API_URL_ENV) {
             Some(url) => url,
@@ -235,12 +249,51 @@ impl SandboxConfig {
         Ok(Self {
             namespace,
             runner_image,
+            profiles,
             runtime_class,
             api_url,
             token,
             ca_pem,
             pull_secret,
         })
+    }
+}
+
+/// Parse `CODING_RUNNER_PROFILES`. Unset or empty is `rust`, the image's historical content; an
+/// unknown name fails closed at startup, so a typo in the deployment is a CrashLoop rather than
+/// a worker that silently refuses a profile it was meant to run.
+fn profiles_from(value: Option<&str>) -> Result<Vec<Profile>, SandboxError> {
+    let Some(value) = value else {
+        return Ok(vec![Profile::Rust]);
+    };
+    let mut profiles = Vec::new();
+    for name in value
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let profile = Profile::parse(name).ok_or_else(|| SandboxError::Invalid {
+            name: PROFILES_ENV,
+            reason: format!("unknown profile {name:?} (known: rust, python)"),
+        })?;
+        if !profiles.contains(&profile) {
+            profiles.push(profile);
+        }
+    }
+    if profiles.is_empty() {
+        profiles.push(Profile::Rust);
+    }
+    Ok(profiles)
+}
+
+/// The profile a job spec asks for. Absent means `rust`, exactly as the API's default does.
+fn profile_of_spec(spec_json: &Value) -> Result<Profile, SandboxError> {
+    match spec_json.pointer("/input/profile").and_then(Value::as_str) {
+        None => Ok(Profile::Rust),
+        Some(name) => Profile::parse(name).ok_or_else(|| SandboxError::Invalid {
+            name: PROFILES_ENV,
+            reason: format!("job asks for unknown profile {name:?}"),
+        }),
     }
 }
 
@@ -429,6 +482,22 @@ impl Sandbox {
         kind: JobKind,
         spec_json: &Value,
     ) -> Result<String, SandboxError> {
+        // Refuse a profile this worker was not configured with BEFORE a Pod is created: the
+        // runner image that starts would not understand the spec, and that would surface as an
+        // `invalid job spec` failure for a job that is perfectly well formed.
+        let profile = profile_of_spec(spec_json)?;
+        if !self.config.profiles.contains(&profile) {
+            return Err(SandboxError::ProfileNotEnabled {
+                requested: profile.as_str().to_owned(),
+                enabled: self
+                    .config
+                    .profiles
+                    .iter()
+                    .map(|profile| profile.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            });
+        }
         let manifest = self.pod_manifest(job_id, tenant, kind, spec_json)?;
         let name = Self::pod_name(job_id);
         let path = format!("/api/v1/namespaces/{}/pods", self.config.namespace);

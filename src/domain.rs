@@ -82,6 +82,54 @@ impl JobKind {
     }
 }
 
+/// The toolchain family a job's command plan runs under.
+///
+/// Closed set, and deliberately not a [`JobKind`]: the estate ruling is that a language is a
+/// property of the code under test, not a new kind of job. `Rust` is the default, and the wire
+/// shape is kept unchanged for it (see [`JobInput::profile`]) so that a runner image built before
+/// profiles existed parses a Rust job exactly as it always did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum Profile {
+    /// Cargo: fmt, clippy, build, test.
+    #[default]
+    Rust,
+    /// uv: lock/sync, ruff, ty, pytest.
+    Python,
+}
+
+impl Profile {
+    /// Stable wire/DB spelling, for the same reason [`JobKind::as_str`] exists.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::Python => "python",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "rust" => Self::Rust,
+            "python" => Self::Python,
+            _ => return None,
+        })
+    }
+
+    /// Whether this is the default. Serde uses it to omit the field entirely for Rust jobs.
+    pub fn is_rust(&self) -> bool {
+        matches!(self, Self::Rust)
+    }
+
+    /// The file whose presence proves the tree is this profile's, checked by the runner against
+    /// the materialised source. A mismatch is reported as `unsupported`, never as a failing check.
+    pub fn marker_file(self) -> &'static str {
+        match self {
+            Self::Rust => "Cargo.toml",
+            Self::Python => "pyproject.toml",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum JobStatus {
@@ -129,6 +177,13 @@ const MAX_INLINE_BYTES: usize = 49_152;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobInput {
+    /// The toolchain family the plan runs under.
+    ///
+    /// Omitted from the wire (and from the stored jsonb) for `rust`, the default: a runner image
+    /// built before profiles existed denies unknown fields, so sending the key for every job
+    /// would break a Rust job during a mixed rollout for no gain.
+    #[serde(default, skip_serializing_if = "Profile::is_rust")]
+    pub profile: Profile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
 }
@@ -481,6 +536,7 @@ mod tests {
 
     fn inline(files: &[(&str, &str)]) -> JobInput {
         JobInput {
+            profile: Profile::Rust,
             source: Some(Source::Inline {
                 files: files
                     .iter()
@@ -495,6 +551,7 @@ mod tests {
 
     fn git(url: &str, git_ref: &str) -> JobInput {
         JobInput {
+            profile: Profile::Rust,
             source: Some(Source::Git {
                 url: url.to_owned(),
                 git_ref: git_ref.to_owned(),
@@ -685,6 +742,7 @@ mod tests {
     fn git_depth_is_bounded() {
         for depth in [0u32, 1001] {
             let input = JobInput {
+                profile: Profile::Rust,
                 source: Some(Source::Git {
                     url: "https://host/repo".to_owned(),
                     git_ref: "main".to_owned(),
@@ -700,6 +758,7 @@ mod tests {
 
     fn upload(id: &str) -> JobInput {
         JobInput {
+            profile: Profile::Rust,
             source: Some(Source::Upload {
                 id: id.to_owned(),
                 url: None,
@@ -738,6 +797,7 @@ mod tests {
     #[test]
     fn a_client_cannot_supply_a_git_token() {
         let input = JobInput {
+            profile: Profile::Rust,
             source: Some(Source::Git {
                 url: "https://github.com/o/r".to_owned(),
                 git_ref: "main".to_owned(),

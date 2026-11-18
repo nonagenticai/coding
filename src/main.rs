@@ -48,9 +48,9 @@ enum Command {
 /// would answer `unsupported`, which is a worse way to learn the kind is not implemented.
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum KindArg {
-    /// Formatting, clippy and the test suite (the pre-push gate).
+    /// Every check the repository's toolchain runs (the pre-push gate).
     Check,
-    /// Formatting and clippy only (the pre-commit gate).
+    /// The fast static checks only: cargo fmt + clippy, or ruff + ty (the pre-commit gate).
     Lint,
     Test,
     Build,
@@ -77,6 +77,10 @@ struct CheckCmd {
     tenant: Option<String>,
     #[arg(long, value_enum, default_value_t = KindArg::Check)]
     kind: KindArg,
+    /// The toolchain profile to run. `auto` reads the packed tree: Cargo.toml + Cargo.lock is
+    /// rust; pyproject.toml + uv.lock is python.
+    #[arg(long, value_enum, default_value_t = client::ProfileArg::Auto)]
+    profile: client::ProfileArg,
     /// How long the job may run inside the Pod, in seconds.
     #[arg(long, default_value_t = 1800)]
     timeout: u32,
@@ -169,6 +173,7 @@ async fn main() -> ExitCode {
                 url: cmd.url,
                 tenant: cmd.tenant,
                 kind: cmd.kind.into(),
+                profile: cmd.profile,
                 timeout_seconds: cmd.timeout,
                 json: cmd.json,
                 dry_run: cmd.dry_run,

@@ -24,7 +24,19 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::domain::JobKind;
+use crate::domain::{JobKind, Profile};
+
+/// The `--profile` the caller asked for. `auto` is resolved from the packed tree; the explicit
+/// values exist for the one layout auto cannot decide (a repository that carries both toolchains).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ProfileArg {
+    /// Detect from the tree: Cargo.toml + Cargo.lock is rust; pyproject.toml + uv.lock is python.
+    Auto,
+    /// Require Cargo.toml + Cargo.lock.
+    Rust,
+    /// Require pyproject.toml + uv.lock.
+    Python,
+}
 
 /// The tree, check names and verdict are all in order.
 pub const EXIT_OK: u8 = 0;
@@ -51,6 +63,8 @@ pub struct CheckArgs {
     /// `--tenant` or `CODING_TENANT`, default `local`.
     pub tenant: Option<String>,
     pub kind: JobKind,
+    /// `--profile`; `auto` (the default) detects the toolchain from the packed tree.
+    pub profile: ProfileArg,
     pub timeout_seconds: u32,
     /// Print the job JSON instead of the human verdict.
     pub json: bool,
@@ -122,13 +136,8 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     for path in &tree.skipped_irregular {
         eprintln!("warning: not sending {path}: not a regular file");
     }
-    if !tree.has("Cargo.toml") || !tree.has("Cargo.lock") {
-        return Err(ClientError::Usage(format!(
-            "{} has no Cargo.toml/Cargo.lock at its root; kind {} runs cargo fmt, clippy and test",
-            tree.root.display(),
-            args.kind.as_str()
-        )));
-    }
+    let profile = detect_profile(&tree, args.profile)?;
+    println!("profile: {}", profile.as_str());
     let blob = pack::pack(&tree).map_err(|err| ClientError::Infra(err.to_string()))?;
     let sha256 = crate::source_archive::sha256_hex(&blob);
     let total = tree.bytes();
@@ -181,9 +190,16 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     println!("uploaded source {source_id}");
 
     // 2. Ask for one check job.
+    let mut input = json!({"source": {"kind": "upload", "id": source_id}});
+    if profile != Profile::Rust {
+        // Omitted for rust on purpose: rust is the server's default, and a runner image built
+        // before profiles existed denies unknown fields, so a Rust job must keep the exact body
+        // it sent before profiles existed.
+        input["profile"] = json!(profile.as_str());
+    }
     let request = json!({
         "kind": args.kind.as_str(),
-        "input": {"source": {"kind": "upload", "id": source_id}},
+        "input": input,
         "timeout_seconds": args.timeout_seconds,
     });
     let created = send_with_retry(|| {
@@ -478,9 +494,120 @@ fn print_verdict(job: &Value) {
     }
 }
 
+/// Resolve the profile from the packed tree.
+///
+/// The profile decides the whole command plan, so a wrong answer spends a Pod and reports a
+/// failure that says nothing about the code. Every ambiguous or unsupported layout is therefore a
+/// usage error here, before anything is uploaded.
+fn detect_profile(tree: &pack::Tree, requested: ProfileArg) -> Result<Profile, ClientError> {
+    let has_rust = tree.has("Cargo.toml") && tree.has("Cargo.lock");
+    let has_python = tree.has("pyproject.toml") && tree.has("uv.lock");
+    match requested {
+        ProfileArg::Rust if has_rust => Ok(Profile::Rust),
+        ProfileArg::Python if has_python => Ok(Profile::Python),
+        ProfileArg::Rust | ProfileArg::Python => {
+            let (flag, files) = if requested == ProfileArg::Rust {
+                ("rust", "Cargo.toml and Cargo.lock")
+            } else {
+                ("python", "pyproject.toml and uv.lock")
+            };
+            Err(ClientError::Usage(format!(
+                "--profile {flag} needs {files} at the root of {}",
+                tree.root.display()
+            )))
+        }
+        ProfileArg::Auto if has_rust && has_python => Err(ClientError::Usage(format!(
+            "{} carries both Cargo.toml/Cargo.lock and pyproject.toml/uv.lock; choose with \
+             --profile rust|python",
+            tree.root.display()
+        ))),
+        ProfileArg::Auto if has_python => Ok(Profile::Python),
+        ProfileArg::Auto if has_rust => Ok(Profile::Rust),
+        ProfileArg::Auto => Err(ClientError::Usage(format!(
+            "{} has neither Cargo.toml + Cargo.lock (rust) nor pyproject.toml + uv.lock (python); \
+             the gate runs one of those toolchains",
+            tree.root.display()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tree(paths: &[&str]) -> pack::Tree {
+        pack::Tree {
+            root: PathBuf::from("/tmp/tree"),
+            files: paths
+                .iter()
+                .map(|path| crate::source_archive::PackFile {
+                    path: (*path).to_owned(),
+                    data: Vec::new(),
+                    executable: false,
+                })
+                .collect(),
+            head: None,
+            dirty: false,
+            skipped_secrets: Vec::new(),
+            skipped_irregular: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn auto_detects_each_layout_and_refuses_the_undecidable_ones() {
+        assert_eq!(
+            detect_profile(&tree(&["Cargo.toml", "Cargo.lock"]), ProfileArg::Auto).unwrap(),
+            Profile::Rust
+        );
+        assert_eq!(
+            detect_profile(&tree(&["pyproject.toml", "uv.lock"]), ProfileArg::Auto).unwrap(),
+            Profile::Python
+        );
+        // Both toolchains: the client cannot know which one the caller means.
+        assert!(matches!(
+            detect_profile(
+                &tree(&["Cargo.toml", "Cargo.lock", "pyproject.toml", "uv.lock"]),
+                ProfileArg::Auto
+            ),
+            Err(ClientError::Usage(_))
+        ));
+        // Neither, and each half of a pair, are all usage errors: a plan without its lock file
+        // would fail as a check, which reads like the repository's fault.
+        for paths in [
+            &["README.md"][..],
+            &["Cargo.toml"][..],
+            &["pyproject.toml"][..],
+            &["Cargo.toml", "pyproject.toml"][..],
+        ] {
+            assert!(
+                matches!(
+                    detect_profile(&tree(paths), ProfileArg::Auto),
+                    Err(ClientError::Usage(_))
+                ),
+                "{paths:?} must be a usage error"
+            );
+        }
+    }
+
+    #[test]
+    fn an_explicit_profile_still_needs_its_own_files() {
+        assert_eq!(
+            detect_profile(&tree(&["Cargo.toml", "Cargo.lock"]), ProfileArg::Rust).unwrap(),
+            Profile::Rust
+        );
+        assert_eq!(
+            detect_profile(&tree(&["pyproject.toml", "uv.lock"]), ProfileArg::Python).unwrap(),
+            Profile::Python
+        );
+        assert!(matches!(
+            detect_profile(&tree(&["Cargo.toml", "Cargo.lock"]), ProfileArg::Python),
+            Err(ClientError::Usage(_))
+        ));
+        assert!(matches!(
+            detect_profile(&tree(&["pyproject.toml", "uv.lock"]), ProfileArg::Rust),
+            Err(ClientError::Usage(_))
+        ));
+    }
 
     fn job(result: Option<Value>, error: Option<Value>) -> Value {
         json!({

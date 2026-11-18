@@ -20,7 +20,11 @@ pub mod redis;
 pub mod result;
 pub mod spec;
 
-use crate::domain::JobKind;
+use crate::domain::{JobKind, Profile};
+
+/// Where the runner image keeps the CPython it preinstalled for the Python profile. The image
+/// installs it read-only; [`crate::runner::exec`] points uv at it for every Python step.
+pub const PYTHON_INSTALL_DIR: &str = "/opt/uv/python";
 
 /// One command in a job's plan. `program` and `args` are static: the plan is compiled in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,72 +67,212 @@ pub fn needs_redis(kind: JobKind) -> bool {
     matches!(kind, JobKind::Test | JobKind::Check)
 }
 
-/// The command plan for a kind. `None` means the kind is not executable by this runner (yet);
-/// the runner reports `unsupported` rather than guessing.
-pub fn plan(kind: JobKind) -> Option<&'static [Planned]> {
-    Some(match kind {
-        JobKind::Test => &[Planned {
-            name: "cargo test",
-            program: "cargo",
-            args: &["test", "--locked"],
-            needs_database: true,
-            needs_redis: true,
-        }],
-        JobKind::Lint => &[
-            Planned {
-                name: "cargo fmt",
-                program: "cargo",
-                args: &["fmt", "--check"],
-                needs_database: false,
-                needs_redis: false,
-            },
-            Planned {
-                name: "cargo clippy",
-                program: "cargo",
-                args: &["clippy", "--all-targets", "--", "-D", "warnings"],
-                needs_database: false,
-                needs_redis: false,
-            },
+/// The Rust plans: one compiled-in table per runnable kind. The pre-commit gate lists the same
+/// three checks as `lint` plus `test`, in the order that fails fastest, so a formatting problem
+/// never hides a failing test.
+const RUST_TEST: &[Planned] = &[Planned {
+    name: "cargo test",
+    program: "cargo",
+    args: &["test", "--locked"],
+    needs_database: true,
+    needs_redis: true,
+}];
+
+const RUST_LINT: &[Planned] = &[
+    Planned {
+        name: "cargo fmt",
+        program: "cargo",
+        args: &["fmt", "--check"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "cargo clippy",
+        program: "cargo",
+        args: &["clippy", "--all-targets", "--", "-D", "warnings"],
+        needs_database: false,
+        needs_redis: false,
+    },
+];
+
+const RUST_BUILD: &[Planned] = &[Planned {
+    name: "cargo build",
+    program: "cargo",
+    args: &["build", "--locked"],
+    needs_database: false,
+    needs_redis: false,
+}];
+
+const RUST_CHECK: &[Planned] = &[
+    Planned {
+        name: "cargo fmt",
+        program: "cargo",
+        args: &["fmt", "--check"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "cargo clippy",
+        program: "cargo",
+        args: &[
+            "clippy",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
         ],
-        JobKind::Build => &[Planned {
-            name: "cargo build",
-            program: "cargo",
-            args: &["build", "--locked"],
-            needs_database: false,
-            needs_redis: false,
-        }],
-        // The pre-commit gate: the three checks that make a push green, in the order that fails
-        // fastest. `exec` aggregates, so a formatting problem never hides a failing test.
-        JobKind::Check => &[
-            Planned {
-                name: "cargo fmt",
-                program: "cargo",
-                args: &["fmt", "--check"],
-                needs_database: false,
-                needs_redis: false,
-            },
-            Planned {
-                name: "cargo clippy",
-                program: "cargo",
-                args: &[
-                    "clippy",
-                    "--all-targets",
-                    "--locked",
-                    "--",
-                    "-D",
-                    "warnings",
-                ],
-                needs_database: false,
-                needs_redis: false,
-            },
-            Planned {
-                name: "cargo test",
-                program: "cargo",
-                args: &["test", "--locked"],
-                needs_database: true,
-                needs_redis: true,
-            },
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "cargo test",
+        program: "cargo",
+        args: &["test", "--locked"],
+        needs_database: true,
+        needs_redis: true,
+    },
+];
+
+/// The Python plans mirror the estate's Python archetype command for command (`uv lock --check`,
+/// `uv sync --all-extras`, `ruff check`, `ruff format --check`, `ty check`, `pytest`), so the
+/// gate's verdict is the one CI would give. `uv sync --locked` instead of the archetype's plain
+/// `uv sync`: the gate must never rewrite the lock file it is judging.
+const PYTHON_LINT: &[Planned] = &[
+    Planned {
+        name: "uv lock",
+        program: "uv",
+        args: &["lock", "--check"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "uv sync",
+        program: "uv",
+        args: &["sync", "--all-extras", "--locked"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "ruff check",
+        program: "uv",
+        args: &["run", "ruff", "check", "."],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "ruff format",
+        program: "uv",
+        // The `--config` value is ONE argv element, not shell text: this plan never goes
+        // through a shell. It is the archetype's spelling, kept identical on purpose.
+        args: &[
+            "run",
+            "ruff",
+            "format",
+            "--check",
+            "--config",
+            "extend-exclude=['*.md']",
+            ".",
         ],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "ty check",
+        program: "uv",
+        // No path: the archetype's `src` default does not exist in a flat layout, and the gate
+        // must not fail on "path does not exist" for a repository CI would accept.
+        args: &["run", "ty", "check"],
+        needs_database: false,
+        needs_redis: false,
+    },
+];
+
+const PYTHON_TEST: &[Planned] = &[
+    Planned {
+        name: "uv sync",
+        program: "uv",
+        args: &["sync", "--all-extras", "--locked"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "pytest",
+        program: "uv",
+        args: &["run", "pytest", "-v", "--tb=short"],
+        needs_database: true,
+        needs_redis: true,
+    },
+];
+
+const PYTHON_CHECK: &[Planned] = &[
+    Planned {
+        name: "uv lock",
+        program: "uv",
+        args: &["lock", "--check"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "uv sync",
+        program: "uv",
+        args: &["sync", "--all-extras", "--locked"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "ruff check",
+        program: "uv",
+        args: &["run", "ruff", "check", "."],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "ruff format",
+        program: "uv",
+        args: &[
+            "run",
+            "ruff",
+            "format",
+            "--check",
+            "--config",
+            "extend-exclude=['*.md']",
+            ".",
+        ],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "ty check",
+        program: "uv",
+        args: &["run", "ty", "check"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "pytest",
+        program: "uv",
+        args: &["run", "pytest", "-v", "--tb=short"],
+        needs_database: true,
+        needs_redis: true,
+    },
+];
+
+/// The command plan for a `(profile, kind)` pair. `None` means this runner cannot execute it —
+/// an unimplemented kind, or a kind the profile has no gate for — and the runner reports
+/// `unsupported` rather than guessing.
+pub fn plan(profile: Profile, kind: JobKind) -> Option<&'static [Planned]> {
+    Some(match (profile, kind) {
+        (Profile::Rust, JobKind::Test) => RUST_TEST,
+        (Profile::Rust, JobKind::Lint) => RUST_LINT,
+        (Profile::Rust, JobKind::Build) => RUST_BUILD,
+        (Profile::Rust, JobKind::Check) => RUST_CHECK,
+        (Profile::Python, JobKind::Test) => PYTHON_TEST,
+        (Profile::Python, JobKind::Lint) => PYTHON_LINT,
+        (Profile::Python, JobKind::Check) => PYTHON_CHECK,
+        // Python has no `build` gate in the estate's archetype. Inventing one would produce a
+        // verdict CI never gives, so this runner says `unsupported` instead.
+        (Profile::Python, JobKind::Build) => return None,
         // Every other kind belongs to a later milestone (analysis, scans, GitHub, parity).
         _ => return None,
     })
@@ -159,32 +303,38 @@ mod tests {
     }
 
     #[test]
-    fn only_the_test_step_asks_for_a_database() {
+    fn only_the_last_step_of_a_test_plan_asks_for_a_database() {
         // The cluster is started lazily, so a step that does not need one must never start it:
         // in the measured failure of 2026-11-15 the cluster died during fmt/clippy's idle
         // window, and the failed `cargo test` that followed read as a bad repository.
-        for kind in [JobKind::Test, JobKind::Check] {
-            let plan = plan(kind).expect("runnable kind");
-            for step in plan {
-                assert_eq!(
-                    step.needs_database,
-                    step.name == "cargo test",
-                    "{kind:?}: {} has the wrong database flag",
-                    step.name
-                );
-                assert_eq!(
-                    step.needs_redis,
-                    step.name == "cargo test",
-                    "{kind:?}: {} has the wrong Redis flag",
-                    step.name
-                );
+        for profile in [Profile::Rust, Profile::Python] {
+            for kind in [JobKind::Test, JobKind::Check] {
+                let plan = plan(profile, kind).expect("runnable kind");
+                let last = plan.last().expect("a plan has at least one step");
+                for step in plan {
+                    let expected = std::ptr::eq(step, last);
+                    assert_eq!(
+                        step.needs_database, expected,
+                        "{profile:?}/{kind:?}: {} has the wrong database flag",
+                        step.name
+                    );
+                    assert_eq!(
+                        step.needs_redis, expected,
+                        "{profile:?}/{kind:?}: {} has the wrong Redis flag",
+                        step.name
+                    );
+                }
             }
         }
-        for kind in [JobKind::Lint, JobKind::Build] {
-            for step in plan(kind).expect("runnable kind") {
+        for (profile, kind) in [
+            (Profile::Rust, JobKind::Lint),
+            (Profile::Rust, JobKind::Build),
+            (Profile::Python, JobKind::Lint),
+        ] {
+            for step in plan(profile, kind).expect("runnable kind") {
                 assert!(
                     !step.needs_database && !step.needs_redis,
-                    "{kind:?}: {} must not start a cluster or a server",
+                    "{profile:?}/{kind:?}: {} must not start a cluster or a server",
                     step.name
                 );
             }
@@ -193,33 +343,85 @@ mod tests {
 
     #[test]
     fn only_runnable_kinds_have_a_plan() {
-        assert!(plan(JobKind::Test).is_some());
-        assert!(plan(JobKind::Lint).is_some());
-        assert!(plan(JobKind::Build).is_some());
-        assert!(plan(JobKind::Check).is_some());
-        for kind in [
-            JobKind::Analyze,
-            JobKind::Scan,
-            JobKind::GithubOp,
-            JobKind::DependencyUpgrade,
-            JobKind::CrateMap,
-            JobKind::ParityOpenapi,
-            JobKind::ParitySchema,
-            JobKind::ParityBehaviour,
-            JobKind::ParityPerf,
-        ] {
-            assert!(plan(kind).is_none(), "{kind:?} must be unsupported");
+        for profile in [Profile::Rust, Profile::Python] {
+            for kind in [JobKind::Test, JobKind::Lint, JobKind::Check] {
+                assert!(plan(profile, kind).is_some(), "{profile:?}/{kind:?}");
+            }
+        }
+        assert!(plan(Profile::Rust, JobKind::Build).is_some());
+        assert!(
+            plan(Profile::Python, JobKind::Build).is_none(),
+            "python has no build gate in the archetype"
+        );
+        for profile in [Profile::Rust, Profile::Python] {
+            for kind in [
+                JobKind::Analyze,
+                JobKind::Scan,
+                JobKind::GithubOp,
+                JobKind::DependencyUpgrade,
+                JobKind::CrateMap,
+                JobKind::ParityOpenapi,
+                JobKind::ParitySchema,
+                JobKind::ParityBehaviour,
+                JobKind::ParityPerf,
+            ] {
+                assert!(
+                    plan(profile, kind).is_none(),
+                    "{profile:?}/{kind:?} must be unsupported"
+                );
+            }
         }
     }
 
     #[test]
     fn plans_never_contain_a_shell() {
-        for kind in [JobKind::Test, JobKind::Lint, JobKind::Build, JobKind::Check] {
-            for planned in plan(kind).expect("runnable kind") {
-                assert_ne!(planned.program, "sh");
-                assert_ne!(planned.program, "bash");
-                assert!(!planned.args.contains(&"-c"));
+        for profile in [Profile::Rust, Profile::Python] {
+            for kind in [JobKind::Test, JobKind::Lint, JobKind::Build, JobKind::Check] {
+                let Some(planned) = plan(profile, kind) else {
+                    continue;
+                };
+                for step in planned {
+                    assert_ne!(step.program, "sh");
+                    assert_ne!(step.program, "bash");
+                    assert!(!step.args.contains(&"-c"));
+                }
             }
         }
+    }
+
+    #[test]
+    fn python_plans_are_the_archetype_commands() {
+        // Drift guard: the gate's verdict is only worth something if these are the commands the
+        // estate's Python CI runs (python-service.yml). Change both together or neither.
+        let lint: Vec<(&str, &[&str])> = plan(Profile::Python, JobKind::Lint)
+            .expect("lint")
+            .iter()
+            .map(|step| (step.program, step.args))
+            .collect();
+        assert_eq!(
+            lint,
+            vec![
+                ("uv", &["lock", "--check"][..]),
+                ("uv", &["sync", "--all-extras", "--locked"][..]),
+                ("uv", &["run", "ruff", "check", "."][..]),
+                (
+                    "uv",
+                    &[
+                        "run",
+                        "ruff",
+                        "format",
+                        "--check",
+                        "--config",
+                        "extend-exclude=['*.md']",
+                        ".",
+                    ][..],
+                ),
+                ("uv", &["run", "ty", "check"][..]),
+            ]
+        );
+        let test = plan(Profile::Python, JobKind::Test).expect("test");
+        assert_eq!(test.len(), 2, "sync, then pytest");
+        assert_eq!(test[1].name, "pytest");
+        assert_eq!(test[1].args, ["run", "pytest", "-v", "--tb=short"]);
     }
 }

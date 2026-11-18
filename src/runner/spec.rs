@@ -298,7 +298,10 @@ mod tests {
             attempt: 1,
             workspace_id: None,
             deadline_seconds: 60,
-            input: JobInput { source },
+            input: JobInput {
+                source,
+                ..Default::default()
+            },
         }
     }
 
