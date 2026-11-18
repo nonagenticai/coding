@@ -124,7 +124,7 @@ Python services read those names.
 
 ## Stack
 
-Rust 1.99.0 (pinned in `rust-toolchain.toml` and the Dockerfile `ARG RUST_TOOLCHAIN`), edition
+Rust 1.100.0 (pinned in `rust-toolchain.toml` and both Dockerfiles' `ARG RUST_TOOLCHAIN`), edition
 2024, axum 0.8, tokio, sqlx 0.9 (runtime queries only, PostgreSQL, embedded migrations), utoipa
 + utoipa-axum (OpenAPI), tracing (JSON logs), thiserror, serde.
 
