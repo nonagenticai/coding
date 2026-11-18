@@ -6,7 +6,15 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- Rust toolchain 1.99.0 → 1.100.0 in `rust-toolchain.toml` and both Dockerfiles' `ARG
+  RUST_TOOLCHAIN`, matching the estate's other Rust services. No behaviour change.
+
 ### Added
+
+- `docs/ARCHITECTURE.md` and `docs/RUNBOOK.md`: the job lifecycle, the closed contract, the
+  sandbox, failure classes, deployment and the local gate in one place.
 
 - Multi-source jobs: `input.sources` carries 1–8 named sources, each with its own toolchain
   profile. Each is materialised under `/tmp/sources/<name>` and its plan runs against it in the

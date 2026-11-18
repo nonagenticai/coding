@@ -16,8 +16,8 @@
 # from Debian, rustup and python-build-standalone; the job's crates and wheels come from
 # crates.io and pypi.org over the sandbox's HTTPS egress.
 #
-# RUST_TOOLCHAIN must equal rust-toolchain.toml and rust_toolchain in .github/workflows/ci.yml.
-ARG RUST_TOOLCHAIN=1.99.0
+# RUST_TOOLCHAIN must equal rust-toolchain.toml and the control-plane Dockerfile.
+ARG RUST_TOOLCHAIN=1.100.0
 
 FROM debian:12-slim AS build
 ARG RUST_TOOLCHAIN

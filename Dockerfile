@@ -2,8 +2,8 @@
 #
 # The builder is debian:12-slim with a pinned toolchain installed by rustup; builder and
 # runtime share one glibc.
-# RUST_TOOLCHAIN must equal rust-toolchain.toml and rust_toolchain in .github/workflows/ci.yml.
-ARG RUST_TOOLCHAIN=1.99.0
+# RUST_TOOLCHAIN must equal rust-toolchain.toml and images/runner/Dockerfile.
+ARG RUST_TOOLCHAIN=1.100.0
 
 FROM debian:12-slim AS build
 ARG RUST_TOOLCHAIN
