@@ -1328,34 +1328,33 @@ fn sccache_stats() -> Option<CacheStats> {
     parse_sccache_stats(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Parse `sccache --show-stats --stats-format=json`.
+/// One counter from sccache's stats document.
 ///
-/// The shape has moved between sccache releases — `cache_hits` has been a number and an object
-/// carrying per-language `counts` — so both are accepted, and anything else is `None` rather than
-/// a guessed number in a result a human will read.
+/// sccache 0.19 serialises `cache_hits`, `cache_misses` and `cache_errors` as `PerLanguageCount`
+/// (`{"counts": {"Rust": 12}}`); older releases used a plain number. Both are accepted, and a shape
+/// that is neither is `None` rather than a zero that reads like a real measurement. A missing
+/// `cache_errors` means no errors were reported, so it defaults to zero.
+fn counter(stats: &serde_json::Value, key: &str) -> Option<u64> {
+    match stats.get(key)? {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::Object(_) => Some(
+            stats.get(key)?["counts"]
+                .as_object()?
+                .values()
+                .filter_map(serde_json::Value::as_u64)
+                .sum(),
+        ),
+        _ => None,
+    }
+}
+
 fn parse_sccache_stats(raw: &str) -> Option<CacheStats> {
     let doc: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
     let stats = doc.get("stats").unwrap_or(&doc);
-    let hits = match stats.get("cache_hits")? {
-        serde_json::Value::Number(number) => number.as_u64()?,
-        serde_json::Value::Object(object) => object
-            .get("counts")?
-            .as_object()?
-            .values()
-            .filter_map(serde_json::Value::as_u64)
-            .sum(),
-        _ => return None,
-    };
     Some(CacheStats {
-        hits,
-        misses: stats
-            .get("cache_misses")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
-        errors: stats
-            .get("cache_errors")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0),
+        hits: counter(stats, "cache_hits")?,
+        misses: counter(stats, "cache_misses")?,
+        errors: counter(stats, "cache_errors").unwrap_or(0),
     })
 }
 
@@ -1529,8 +1528,10 @@ mod tests {
 
     #[test]
     fn parses_both_sccache_stats_shapes_and_refuses_a_guess() {
-        // sccache 0.19 reports per-language counts.
-        let counts = r#"{"stats":{"compile_requests":9,"cache_hits":{"counts":{"Rust":5,"C/C++":2}},"cache_misses":2,"cache_errors":1}}"#;
+        // The shape the runner actually receives: sccache 0.19 serialises ALL THREE counters as
+        // per-language counts. The original fixture below used numbers for misses and errors,
+        // which is why a parser that read them as zero passed the test and lied in production.
+        let counts = r#"{"stats":{"compile_requests":9,"cache_hits":{"counts":{"Rust":5,"C/C++":2}},"cache_misses":{"counts":{"Rust":2}},"cache_errors":{"counts":{"Rust":1}}}}"#;
         assert_eq!(
             parse_sccache_stats(counts),
             Some(CacheStats {
@@ -1539,7 +1540,7 @@ mod tests {
                 errors: 1
             })
         );
-        // Older releases reported a single number.
+        // Older releases reported a single number, and may omit cache_errors entirely.
         let number = r#"{"stats":{"cache_hits":4,"cache_misses":1}}"#;
         assert_eq!(
             parse_sccache_stats(number),
@@ -1552,6 +1553,11 @@ mod tests {
         // Anything else is absent — never a guessed zero that reads like "the cache did nothing".
         assert_eq!(parse_sccache_stats("not json"), None);
         assert_eq!(parse_sccache_stats(r#"{"stats":{"unexpected":1}}"#), None);
+        // Present but unreadable is refused too: a zero there would be a lie, not a measurement.
+        assert_eq!(
+            parse_sccache_stats(r#"{"stats":{"cache_hits":{},"cache_misses":{"counts":{}}}}"#),
+            None
+        );
     }
 
     #[test]
