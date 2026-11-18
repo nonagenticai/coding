@@ -120,6 +120,14 @@ fn units<'a>(spec: &'a RunnerSpec, work_dir: &Path) -> Vec<Unit<'a>> {
         .collect()
 }
 
+/// A step's name, plus the source it ran against when the job has several.
+fn step_label(unit: &Unit<'_>, step: &str) -> String {
+    match unit.name {
+        Some(name) => format!("{step} on source {name:?}"),
+        None => step.to_owned(),
+    }
+}
+
 /// Put the (possibly partial) source summaries on the result, in the shape the caller used: a
 /// single-source job reports `source`, a multi-source job `sources`. Called before a failure
 /// return too, so the result of a job that died while materialising source 2 still names source 1.
@@ -300,6 +308,9 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
         let target_dir = target_dir_for(&unit.dir);
         let python = unit.profile == Profile::Python;
         for step in planned {
+            // Every message about this step names its source when the job has several: one Pod
+            // can run four plans, and "pytest timed out" does not say which tree hung.
+            let label = step_label(unit, step.name);
             // A step is attempted twice **only** when the database died under it. The first attempt's
             // death is printed with its log tail, so the retry hides nothing; a second death is the
             // job's error. The measured failure (a cluster that vanished while the test step was still
@@ -317,7 +328,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                             // question is always *which* database it was told to use.
                             println!(
                                 "== postgres: `{}` gets TEST_DATABASE_URL={url} accepting={}",
-                                step.name,
+                                label,
                                 crate::runner::postgres::accepting_connections().await
                             );
                             database_alias = Some(sqlalchemy_dsn(&url));
@@ -325,7 +336,8 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                         }
                         Err(error) => {
                             result.status = Status::Failed;
-                            result.summary = "the throwaway Postgres is not usable".to_owned();
+                            result.summary =
+                                format!("the throwaway Postgres is not usable for {label}");
                             result.error = Some(error);
                             return result;
                         }
@@ -341,7 +353,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                                 .unwrap_or(crate::runner::redis::PORT);
                             println!(
                                 "== redis: `{}` gets TEST_REDIS_URL={url} accepting={}",
-                                step.name,
+                                label,
                                 crate::runner::redis::accepting_connections(port).await
                             );
                             redis_port = Some(port.to_string());
@@ -349,7 +361,8 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                         }
                         Err(error) => {
                             result.status = Status::Failed;
-                            result.summary = "the throwaway Redis is not usable".to_owned();
+                            result.summary =
+                                format!("the throwaway Redis is not usable for {label}");
                             result.error = Some(error);
                             return result;
                         }
@@ -357,10 +370,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                     let can_private = redis.can_start_private();
                     match redis.ensure_private().await {
                         Ok(url) => {
-                            println!(
-                                "== redis: `{}` gets TEST_REDIS_PRIVATE_URL={url}",
-                                step.name
-                            );
+                            println!("== redis: `{}` gets TEST_REDIS_PRIVATE_URL={url}", label);
                             private_redis_url = Some(url);
                         }
                         // The private server exists for one test shape (a FLUSHALL that must not touch
@@ -370,7 +380,8 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                         // setup error.
                         Err(error) if can_private => {
                             result.status = Status::Failed;
-                            result.summary = "the private throwaway Redis is not usable".to_owned();
+                            result.summary =
+                                format!("the private throwaway Redis is not usable for {label}");
                             result.error = Some(error);
                             return result;
                         }
@@ -436,8 +447,8 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                     Ok(outcome) => outcome,
                     Err(err) => {
                         result.status = Status::Failed;
-                        result.error = Some(format!("{} could not start: {err}", step.name));
-                        result.summary = format!("{} could not start", step.name);
+                        result.error = Some(format!("{label} could not start: {err}"));
+                        result.summary = format!("{label} could not start");
                         return result;
                     }
                 };
@@ -460,12 +471,12 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                             && database.is_ours()
                             && !crate::runner::postgres::accepting_connections().await
                         {
-                            let death = database.died(step.name);
+                            let death = database.died(&label);
                             println!("== postgres: {death}");
                             if attempt >= SERVICE_ATTEMPTS {
                                 result.status = Status::Failed;
                                 result.summary =
-                                    format!("the throwaway Postgres died during {}", step.name);
+                                    format!("the throwaway Postgres died during {label}");
                                 result.error = Some(death);
                                 return result;
                             }
@@ -474,7 +485,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                                     println!(
                                         "== postgres: restarted; re-running `{}` (attempt {} of \
                                      {SERVICE_ATTEMPTS})",
-                                        step.name,
+                                        label,
                                         attempt + 1
                                     );
                                     continue 'attempt;
@@ -482,7 +493,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                                 Err(error) => {
                                     result.status = Status::Failed;
                                     result.summary =
-                                        format!("the throwaway Postgres died during {}", step.name);
+                                        format!("the throwaway Postgres died during {label}");
                                     result.error = Some(format!("{death}\n{error}"));
                                     return result;
                                 }
@@ -502,12 +513,11 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                             )
                             .await;
                         if failed && step.needs_redis && (redis_dead || private_redis_dead) {
-                            let death = redis.died(step.name);
+                            let death = redis.died(&label);
                             println!("== redis: {death}");
                             if attempt >= SERVICE_ATTEMPTS {
                                 result.status = Status::Failed;
-                                result.summary =
-                                    format!("the throwaway Redis died during {}", step.name);
+                                result.summary = format!("the throwaway Redis died during {label}");
                                 result.error = Some(death);
                                 return result;
                             }
@@ -516,7 +526,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                                     println!(
                                         "== redis: restarted; re-running `{}` (attempt {} of \
                                      {SERVICE_ATTEMPTS})",
-                                        step.name,
+                                        label,
                                         attempt + 1
                                     );
                                     continue 'attempt;
@@ -524,7 +534,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                                 Err(error) => {
                                     result.status = Status::Failed;
                                     result.summary =
-                                        format!("the throwaway Redis died during {}", step.name);
+                                        format!("the throwaway Redis died during {label}");
                                     result.error = Some(format!("{death}\n{error}"));
                                     return result;
                                 }
@@ -552,14 +562,17 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                     Stop::TimedOut => {
                         result.status = Status::Timeout;
                         result.summary = format!(
-                            "the job deadline of {}s was exceeded during {}",
-                            spec.deadline_seconds, step.name
+                            "the job deadline of {}s was exceeded during {label}",
+                            spec.deadline_seconds
                         );
                         return result;
                     }
                     Stop::Cancelled => {
                         result.status = Status::Cancelled;
-                        result.summary = "the job was cancelled while running".to_owned();
+                        result.summary = match unit.name {
+                            Some(_) => format!("the job was cancelled while running (at {label})"),
+                            None => "the job was cancelled while running".to_owned(),
+                        };
                         return result;
                     }
                 }
@@ -1432,6 +1445,27 @@ pub fn default_source_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_step_label_names_its_source_only_when_the_job_has_several() {
+        let multi = Unit {
+            name: Some("source-1"),
+            profile: Profile::Rust,
+            source: None,
+            dir: PathBuf::from("/tmp/sources/source-1"),
+        };
+        assert_eq!(
+            step_label(&multi, "cargo test"),
+            "cargo test on source \"source-1\""
+        );
+        let single = Unit {
+            name: None,
+            profile: Profile::Rust,
+            source: None,
+            dir: PathBuf::from("/tmp/src"),
+        };
+        assert_eq!(step_label(&single, "cargo test"), "cargo test");
+    }
 
     #[test]
     fn tail_bounds_the_error_text() {
