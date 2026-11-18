@@ -171,9 +171,38 @@ impl JobStatus {
 /// Pod env var, so the files must leave room for the envelope.
 const MAX_INLINE_BYTES: usize = 49_152;
 
+/// How many named sources one job may carry. The unified run the rewrite gate needs is one target
+/// plus a handful of pinned sources; the cap bounds the Pod's 8 GiB scratch and its deadline.
+pub const MAX_SOURCES: usize = 8;
+
+/// A source name is a path component under `/tmp/sources`: lowercase, a leading letter, no
+/// separators. Validating it here keeps a request from naming a path outside that directory.
+pub const MAX_SOURCE_NAME_BYTES: usize = 32;
+
+/// Whether a source name is one the runner can materialise as `/tmp/sources/<name>`.
+pub fn valid_source_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    if bytes.is_empty() || bytes.len() > MAX_SOURCE_NAME_BYTES {
+        return false;
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+}
+
+/// How large the serialised input may be. The Pod spec rides in one 64 KiB env var, so the input
+/// must leave room for the worker's envelope (job ids, the deadline) *and* the fields the worker
+/// adds afterwards (an upload's url/token/sha256, an installation token). Counted on the JSON,
+/// not the file text: escaping can make a small tree large.
+const MAX_INPUT_JSON_BYTES: usize = 52 * 1024;
+
 /// The typed, closed input a job carries. `source` says where the code comes from; a kind that
-/// needs code must supply it. Unknown fields are a parse error, so a caller cannot smuggle a
-/// field this contract does not name into the stored jsonb.
+/// needs code must supply it. `sources` is the multi-source form — every entry names its own
+/// toolchain profile — and the two are mutually exclusive. Unknown fields are a parse error, so a
+/// caller cannot smuggle a field this contract does not name into the stored jsonb.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JobInput {
@@ -182,10 +211,33 @@ pub struct JobInput {
     /// Omitted from the wire (and from the stored jsonb) for `rust`, the default: a runner image
     /// built before profiles existed denies unknown fields, so sending the key for every job
     /// would break a Rust job during a mixed rollout for no gain.
+    ///
+    /// With `sources`, this must be left at the default: each named source carries its own
+    /// profile, and two opinions about one tree are a request error rather than a precedence rule.
     #[serde(default, skip_serializing_if = "Profile::is_rust")]
     pub profile: Profile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
+    /// Several named sources checked in one Pod, each under its own profile.
+    ///
+    /// Omitted when empty, for the same mixed-rollout reason as `profile`: a runner image built
+    /// before this field existed denies unknown fields, so a single-source job must not carry it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<NamedSource>,
+}
+
+/// One source of a multi-source job: the name it is materialised under and the profile its plan
+/// runs under. The pair is explicit because a unified run checks a Rust target and its pinned
+/// Python sources in one Pod.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NamedSource {
+    /// The directory name: `/tmp/sources/<name>`.
+    pub name: String,
+    /// The toolchain family this source's plan runs under.
+    pub profile: Profile,
+    /// Where this source comes from.
+    pub source: Source,
 }
 
 /// Where the code under test comes from. Tagged by `kind`, so a typo is a parse error rather than
@@ -264,16 +316,93 @@ fn needs_source(kind: JobKind) -> bool {
 
 impl JobInput {
     /// Enforce the input contract for `kind`: a source is required for the kinds that run code,
-    /// and any source that is present must be materialisable.
+    /// and every source that is present must be materialisable.
     pub fn validate(&self, kind: JobKind) -> Result<(), InputError> {
-        match &self.source {
-            Some(source) => validate_source(source),
-            None if needs_source(kind) => Err(InputError::new(format!(
-                "kind {} requires input.source",
+        self.validate_shape()?;
+        if self.source.is_none() && self.sources.is_empty() && needs_source(kind) {
+            return Err(InputError::new(format!(
+                "kind {} requires input.source or input.sources",
                 kind.as_str()
-            ))),
-            None => Ok(()),
+            )));
         }
+        Ok(())
+    }
+
+    /// The rules that hold for every kind, including the ones that run no code.
+    fn validate_shape(&self) -> Result<(), InputError> {
+        if self.source.is_some() && !self.sources.is_empty() {
+            return Err(InputError::new(
+                "input.source and input.sources are mutually exclusive; send exactly one form",
+            ));
+        }
+        if let Some(source) = &self.source {
+            validate_source(source)?;
+        }
+        if !self.sources.is_empty() {
+            if !self.profile.is_rust() {
+                return Err(InputError::new(
+                    "input.profile must be omitted when input.sources is used: each named source \
+                     carries its own profile",
+                ));
+            }
+            if self.sources.len() > MAX_SOURCES {
+                return Err(InputError::new(format!(
+                    "input.sources carries {} sources, over the {MAX_SOURCES}-source cap",
+                    self.sources.len()
+                )));
+            }
+            let mut names = std::collections::HashSet::with_capacity(self.sources.len());
+            let mut inline_total = 0usize;
+            for named in &self.sources {
+                if !valid_source_name(&named.name) {
+                    return Err(InputError::new(format!(
+                        "source name {:?} must match ^[a-z][a-z0-9-]{{0,{}}}",
+                        named.name,
+                        MAX_SOURCE_NAME_BYTES - 1
+                    )));
+                }
+                if !names.insert(named.name.as_str()) {
+                    return Err(InputError::new(format!(
+                        "input.sources repeats the name {:?}",
+                        named.name
+                    )));
+                }
+                validate_source(&named.source)?;
+                inline_total = inline_total.saturating_add(inline_bytes(&named.source));
+            }
+            // The per-source cap bounds one tree; this bounds the job, so several inline sources
+            // cannot together outgrow the Pod env the whole spec rides in.
+            if inline_total > MAX_INLINE_BYTES {
+                return Err(InputError::new(format!(
+                    "inline sources total {inline_total} bytes, over the {MAX_INLINE_BYTES}-byte cap"
+                )));
+            }
+        }
+        // The spec is serialised into a Pod env var; refuse here what the sandbox would reject
+        // later, before a row exists and a caller waits on it.
+        let bytes = match serde_json::to_string(self) {
+            Ok(json) => json.len(),
+            Err(err) => {
+                return Err(InputError::new(format!(
+                    "input could not be serialised: {err}"
+                )));
+            }
+        };
+        if bytes > MAX_INPUT_JSON_BYTES {
+            return Err(InputError::new(format!(
+                "input serialises to {bytes} bytes, over the {MAX_INPUT_JSON_BYTES}-byte cap \
+                 (escaping counts against it)"
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The file text an inline source carries; zero for every source that is a reference.
+fn inline_bytes(source: &Source) -> usize {
+    match source {
+        Source::Inline { files } => files.iter().map(|file| file.text.len()).sum(),
+        Source::Git { .. } | Source::Upload { .. } => 0,
     }
 }
 
@@ -537,6 +666,7 @@ mod tests {
     fn inline(files: &[(&str, &str)]) -> JobInput {
         JobInput {
             profile: Profile::Rust,
+            sources: Vec::new(),
             source: Some(Source::Inline {
                 files: files
                     .iter()
@@ -552,6 +682,7 @@ mod tests {
     fn git(url: &str, git_ref: &str) -> JobInput {
         JobInput {
             profile: Profile::Rust,
+            sources: Vec::new(),
             source: Some(Source::Git {
                 url: url.to_owned(),
                 git_ref: git_ref.to_owned(),
@@ -591,7 +722,10 @@ mod tests {
             assert_eq!(error.code, "invalid_job_input");
             assert_eq!(
                 error.message,
-                format!("kind {} requires input.source", kind.as_str())
+                format!(
+                    "kind {} requires input.source or input.sources",
+                    kind.as_str()
+                )
             );
         }
         // Every other kind runs without code, so a source is optional there.
@@ -743,6 +877,7 @@ mod tests {
         for depth in [0u32, 1001] {
             let input = JobInput {
                 profile: Profile::Rust,
+                sources: Vec::new(),
                 source: Some(Source::Git {
                     url: "https://host/repo".to_owned(),
                     git_ref: "main".to_owned(),
@@ -759,6 +894,7 @@ mod tests {
     fn upload(id: &str) -> JobInput {
         JobInput {
             profile: Profile::Rust,
+            sources: Vec::new(),
             source: Some(Source::Upload {
                 id: id.to_owned(),
                 url: None,
@@ -798,6 +934,7 @@ mod tests {
     fn a_client_cannot_supply_a_git_token() {
         let input = JobInput {
             profile: Profile::Rust,
+            sources: Vec::new(),
             source: Some(Source::Git {
                 url: "https://github.com/o/r".to_owned(),
                 git_ref: "main".to_owned(),
@@ -851,5 +988,173 @@ mod tests {
         assert_eq!(value["source"]["kind"], "inline");
         assert_eq!(value["source"]["files"][0]["path"], "Cargo.toml");
         assert_eq!(value["source"]["files"][0]["text"], "x");
+    }
+
+    fn named(name: &str, profile: Profile, git_ref: &str) -> NamedSource {
+        NamedSource {
+            name: name.to_owned(),
+            profile,
+            source: Source::Git {
+                url: format!("https://github.com/o/{name}"),
+                git_ref: git_ref.to_owned(),
+                depth: 1,
+                token: None,
+            },
+        }
+    }
+
+    fn sources(list: Vec<NamedSource>) -> JobInput {
+        JobInput {
+            profile: Profile::Rust,
+            source: None,
+            sources: list,
+        }
+    }
+
+    #[test]
+    fn a_multi_source_job_is_two_named_sources() {
+        let input = sources(vec![
+            named("target", Profile::Rust, "main"),
+            named("source-1", Profile::Python, "abc123"),
+        ]);
+        assert!(input.validate(JobKind::Check).is_ok());
+        // The wire keeps the named form, and a source names its own profile.
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value["sources"][0]["name"], "target");
+        assert_eq!(value["sources"][1]["profile"], "python");
+        assert!(value.get("source").is_none());
+        // A single-source job must not gain a `sources` key: an old runner denies unknown fields.
+        let value = serde_json::to_value(git("https://host/repo", "main")).unwrap();
+        assert!(value.get("sources").is_none());
+    }
+
+    #[test]
+    fn the_two_source_forms_are_mutually_exclusive() {
+        for kind in [JobKind::Test, JobKind::Lint, JobKind::Build, JobKind::Check] {
+            let mut input = sources(vec![named("target", Profile::Rust, "main")]);
+            input.source = Some(Source::Git {
+                url: "https://host/repo".to_owned(),
+                git_ref: "main".to_owned(),
+                depth: 1,
+                token: None,
+            });
+            let error = reject(&input, kind);
+            assert!(
+                error.message.contains("mutually exclusive"),
+                "{}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_source_must_be_a_safe_path_component() {
+        for bad in [
+            "",
+            "Target",
+            "1target",
+            "tar get",
+            "target/one",
+            "target.one",
+            "../target",
+            "target_1",
+            &"a".repeat(MAX_SOURCE_NAME_BYTES + 1),
+        ] {
+            let error = reject(
+                &sources(vec![named(bad, Profile::Rust, "main")]),
+                JobKind::Check,
+            );
+            assert!(error.message.contains("source name"), "{bad:?}");
+        }
+        for good in ["target", "source-1", "a", "py-source-2024"] {
+            assert!(
+                sources(vec![named(good, Profile::Rust, "main")])
+                    .validate(JobKind::Check)
+                    .is_ok(),
+                "{good:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn names_are_unique_and_the_count_is_bounded() {
+        let error = reject(
+            &sources(vec![
+                named("target", Profile::Rust, "main"),
+                named("target", Profile::Python, "main"),
+            ]),
+            JobKind::Check,
+        );
+        assert!(error.message.contains("repeats the name"), "{error:?}");
+
+        let over: Vec<NamedSource> = (0..=MAX_SOURCES)
+            .map(|index| named(&format!("source-{index}"), Profile::Rust, "main"))
+            .collect();
+        let error = reject(&sources(over), JobKind::Check);
+        assert!(error.message.contains("source cap"), "{error:?}");
+    }
+
+    #[test]
+    fn the_job_level_profile_must_be_omitted_with_sources() {
+        let mut input = sources(vec![named("target", Profile::Rust, "main")]);
+        input.profile = Profile::Python;
+        let error = reject(&input, JobKind::Check);
+        assert!(error.message.contains("input.profile"), "{error:?}");
+    }
+
+    #[test]
+    fn inline_bytes_are_summed_across_sources() {
+        let big = "x".repeat(MAX_INLINE_BYTES / 2 + 1);
+        let input = sources(vec![
+            NamedSource {
+                name: "one".to_owned(),
+                profile: Profile::Rust,
+                source: Source::Inline {
+                    files: vec![InlineFile {
+                        path: "Cargo.toml".to_owned(),
+                        text: big.clone(),
+                    }],
+                },
+            },
+            NamedSource {
+                name: "two".to_owned(),
+                profile: Profile::Rust,
+                source: Source::Inline {
+                    files: vec![InlineFile {
+                        path: "Cargo.toml".to_owned(),
+                        text: big,
+                    }],
+                },
+            },
+        ]);
+        let error = reject(&input, JobKind::Check);
+        assert!(error.message.contains("inline sources total"), "{error:?}");
+    }
+
+    #[test]
+    fn an_escaping_source_cannot_outgrow_the_pod_spec() {
+        // Control characters are one byte of text and six bytes of JSON; the cap is on the JSON.
+        let input = sources(vec![NamedSource {
+            name: "one".to_owned(),
+            profile: Profile::Rust,
+            source: Source::Inline {
+                files: vec![InlineFile {
+                    path: "src/lib.rs".to_owned(),
+                    text: "\u{1}".repeat(MAX_INLINE_BYTES / 2),
+                }],
+            },
+        }]);
+        let error = reject(&input, JobKind::Check);
+        assert!(error.message.contains("serialises to"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_named_git_source_cannot_supply_its_own_token() {
+        let mut source = named("target", Profile::Rust, "main");
+        if let Source::Git { token, .. } = &mut source.source {
+            *token = Some("ghs_supplied".to_owned());
+        }
+        let error = reject(&sources(vec![source]), JobKind::Check);
+        assert!(error.message.contains("minted by the server"), "{error:?}");
     }
 }

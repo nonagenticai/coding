@@ -6,14 +6,29 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Multi-source jobs: `input.sources` carries 1–8 named sources, each with its own toolchain
+  profile. Each is materialised under `/tmp/sources/<name>` and its plan runs against it in the
+  same Pod, against the same throwaway PostgreSQL/Redis — one run that checks a Rust target and
+  its pinned Python sources together. Checks name their source and the result lists `sources[]`;
+  a single-source job keeps its exact old wire shape. The worker refuses a `sources` job before a
+  Pod unless `CODING_RUNNER_MULTI_SOURCE` enables it, and checks every named source's profile.
+
 ### Fixed
 
 - The Python profile's `ty` step checks `src` (the archetype's scope), not the whole project. A
   whole-project check reports diagnostics in `tests/` that CI never sees and blocked a push the
   estate's CI would accept.
+- A runner Pod that exited 0 without writing its result line used to be reported as a successful
+  job (`{"exit":"succeeded"}`) with no verdict at all — a gate that passes when its verdict is
+  missing. It is now a non-retryable `runner_failed`. The runner also bounds its own result line
+  (192 KiB, output tails dropped with a marker) so a job with several dozen checks cannot be cut
+  by the worker's 256 KiB log read.
+- The source reaper now also sees upload ids referenced from a job's `sources` list, so a queued
+  multi-source job cannot have its archive reaped under it.
 
-
-### Added
+### Added (earlier unreleased work)
 
 - Language profiles: a job names the toolchain (`rust` or `python`) in its input, and the runner
   executes that profile's compiled-in plan in the same Pod. `rust` is the default and is omitted

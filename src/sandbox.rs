@@ -32,6 +32,10 @@ use crate::domain::{JobKind, Profile};
 pub const NAMESPACE_ENV: &str = "CODING_RUNS_NAMESPACE";
 /// `CODING_RUNNER_IMAGE`: the runner image, `image@sha256:<digest>`. Required.
 pub const RUNNER_IMAGE_ENV: &str = "CODING_RUNNER_IMAGE";
+/// `CODING_RUNNER_MULTI_SOURCE`: whether the pinned runner image executes a job's `sources` list.
+/// Absent or anything but an affirmative value is `false` — a typo refuses the job before a Pod
+/// rather than sending a spec the image cannot parse.
+pub const MULTI_SOURCE_ENV: &str = "CODING_RUNNER_MULTI_SOURCE";
 /// `CODING_RUNNER_PROFILES`: the toolchain profiles the runner image carries, comma-separated.
 /// Unset means `rust`, the image's historical content. A job naming a profile that is not listed
 /// is refused before a Pod is created, so a deployment that has not been told about a profile
@@ -124,6 +128,12 @@ pub enum SandboxError {
         "profile {requested:?} is not enabled on this worker (CODING_RUNNER_PROFILES={enabled:?})"
     )]
     ProfileNotEnabled { requested: String, enabled: String },
+    /// The job carries a `sources` list and the pinned runner image predates support for it.
+    #[error(
+        "this worker's runner image does not execute multi-source jobs (set {MULTI_SOURCE_ENV}=1 \
+         when the image does)"
+    )]
+    SourcesNotEnabled,
 }
 
 /// The sandbox client's configuration. Built from env in a pod, from a lookup in tests.
@@ -137,6 +147,10 @@ pub struct SandboxConfig {
     /// The toolchain profiles that image can execute. `rust` unless `CODING_RUNNER_PROFILES`
     /// says otherwise; a job asking for anything else is refused before a Pod exists.
     pub profiles: Vec<Profile>,
+    /// Whether that image executes a job's `sources` list. `false` unless
+    /// `CODING_RUNNER_MULTI_SOURCE` says otherwise, so a job created before the image was
+    /// rolled is refused with a legible message instead of `invalid job spec` from the Pod.
+    pub multi_source: bool,
     /// The RuntimeClass that selects the kata runtime.
     pub runtime_class: String,
     /// The API server base URL, e.g. `https://10.43.0.1:443`.
@@ -186,6 +200,7 @@ impl SandboxConfig {
         let runtime_class =
             get(RUNTIME_CLASS_ENV).unwrap_or_else(|| DEFAULT_RUNTIME_CLASS.to_owned());
         let profiles = profiles_from(get(PROFILES_ENV).as_deref())?;
+        let multi_source = multi_source_from(get(MULTI_SOURCE_ENV).as_deref());
 
         let api_url = match get(API_URL_ENV) {
             Some(url) => url,
@@ -250,6 +265,7 @@ impl SandboxConfig {
             namespace,
             runner_image,
             profiles,
+            multi_source,
             runtime_class,
             api_url,
             token,
@@ -286,6 +302,15 @@ fn profiles_from(value: Option<&str>) -> Result<Vec<Profile>, SandboxError> {
     Ok(profiles)
 }
 
+/// Parse `CODING_RUNNER_MULTI_SOURCE`. Only an affirmative value enables the capability; a typo
+/// leaves it off, which refuses the job instead of sending a spec the image cannot parse.
+fn multi_source_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim),
+        Some("1" | "true" | "yes" | "TRUE" | "YES")
+    )
+}
+
 /// The profile a job spec asks for. Absent means `rust`, exactly as the API's default does.
 fn profile_of_spec(spec_json: &Value) -> Result<Profile, SandboxError> {
     match spec_json.pointer("/input/profile").and_then(Value::as_str) {
@@ -295,6 +320,44 @@ fn profile_of_spec(spec_json: &Value) -> Result<Profile, SandboxError> {
             reason: format!("job asks for unknown profile {name:?}"),
         }),
     }
+}
+
+/// Every profile a job spec asks for: one per named source, or the job-level profile for a
+/// single-source job. A named source without a profile is a request error, and an unknown one is
+/// refused exactly as a job-level unknown profile is.
+fn profiles_of_spec(spec_json: &Value) -> Result<Vec<Profile>, SandboxError> {
+    let Some(sources) = spec_json
+        .pointer("/input/sources")
+        .and_then(Value::as_array)
+        .filter(|sources| !sources.is_empty())
+    else {
+        return Ok(vec![profile_of_spec(spec_json)?]);
+    };
+    let mut profiles = Vec::with_capacity(sources.len());
+    for (index, source) in sources.iter().enumerate() {
+        let Some(name) = source.get("profile").and_then(Value::as_str) else {
+            return Err(SandboxError::Invalid {
+                name: PROFILES_ENV,
+                reason: format!("input.sources[{index}] names no profile"),
+            });
+        };
+        let profile = Profile::parse(name).ok_or_else(|| SandboxError::Invalid {
+            name: PROFILES_ENV,
+            reason: format!("input.sources[{index}] asks for unknown profile {name:?}"),
+        })?;
+        if !profiles.contains(&profile) {
+            profiles.push(profile);
+        }
+    }
+    Ok(profiles)
+}
+
+/// Whether the spec carries the multi-source form.
+fn has_sources(spec_json: &Value) -> bool {
+    spec_json
+        .pointer("/input/sources")
+        .and_then(Value::as_array)
+        .is_some_and(|sources| !sources.is_empty())
 }
 
 /// `imagePullSecrets` as the API expects it: an empty list when no secret is configured.
@@ -482,21 +545,25 @@ impl Sandbox {
         kind: JobKind,
         spec_json: &Value,
     ) -> Result<String, SandboxError> {
-        // Refuse a profile this worker was not configured with BEFORE a Pod is created: the
-        // runner image that starts would not understand the spec, and that would surface as an
-        // `invalid job spec` failure for a job that is perfectly well formed.
-        let profile = profile_of_spec(spec_json)?;
-        if !self.config.profiles.contains(&profile) {
-            return Err(SandboxError::ProfileNotEnabled {
-                requested: profile.as_str().to_owned(),
-                enabled: self
-                    .config
-                    .profiles
-                    .iter()
-                    .map(|profile| profile.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-            });
+        // Refuse a spec shape or profile this worker was not configured with BEFORE a Pod is
+        // created: the runner image that starts would not understand the spec, and that would
+        // surface as an `invalid job spec` failure for a job that is perfectly well formed.
+        if has_sources(spec_json) && !self.config.multi_source {
+            return Err(SandboxError::SourcesNotEnabled);
+        }
+        for profile in profiles_of_spec(spec_json)? {
+            if !self.config.profiles.contains(&profile) {
+                return Err(SandboxError::ProfileNotEnabled {
+                    requested: profile.as_str().to_owned(),
+                    enabled: self
+                        .config
+                        .profiles
+                        .iter()
+                        .map(|profile| profile.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                });
+            }
         }
         let manifest = self.pod_manifest(job_id, tenant, kind, spec_json)?;
         let name = Self::pod_name(job_id);
@@ -869,5 +936,95 @@ mod tests {
     fn the_truncation_marker_stays_within_the_cap() {
         let bounded = bounded_log(&vec![b'x'; LOG_BYTE_CAP * 2], true);
         assert!(bounded.len() <= LOG_BYTE_CAP);
+    }
+
+    fn config_with(pairs: &[(&str, &str)]) -> SandboxConfig {
+        SandboxConfig::from_lookup(
+            |key| {
+                pairs
+                    .iter()
+                    .find(|(name, _)| *name == key)
+                    .map(|(_, value)| (*value).to_owned())
+            },
+            |_| None,
+        )
+        .expect("a plaintext test configuration")
+    }
+
+    fn base_pairs() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (NAMESPACE_ENV, "coding-runs"),
+            (RUNNER_IMAGE_ENV, "example@sha256:abc"),
+            (API_URL_ENV, "http://127.0.0.1:1"),
+            (TOKEN_ENV, "test-token"),
+        ]
+    }
+
+    #[test]
+    fn multi_source_is_off_unless_the_value_is_affirmative() {
+        assert!(multi_source_from(Some("1")));
+        assert!(multi_source_from(Some("true")));
+        assert!(!multi_source_from(Some("0")));
+        assert!(!multi_source_from(Some("maybe")));
+        assert!(!multi_source_from(None));
+    }
+
+    #[test]
+    fn every_named_source_profile_is_collected() {
+        let spec = serde_json::json!({"input": {"sources": [
+            {"name": "target", "profile": "rust", "source": {"kind": "git", "url": "https://x/y"}},
+            {"name": "source-1", "profile": "python", "source": {"kind": "git", "url": "https://x/z"}}
+        ]}});
+        assert_eq!(
+            profiles_of_spec(&spec).expect("known profiles"),
+            vec![Profile::Rust, Profile::Python]
+        );
+        // A named source without a profile is a request error, not a default.
+        let spec = serde_json::json!({"input": {"sources": [
+            {"name": "target", "source": {"kind": "git", "url": "https://x/y"}}
+        ]}});
+        assert!(profiles_of_spec(&spec).is_err());
+        // A single-source job still answers with its job-level profile.
+        let spec = serde_json::json!({"input": {"profile": "python"}});
+        assert_eq!(
+            profiles_of_spec(&spec).expect("known"),
+            vec![Profile::Python]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sources_job_is_refused_before_any_pod_when_the_image_predates_it() {
+        let sandbox = Sandbox::new(config_with(&base_pairs())).expect("client");
+        let spec = serde_json::json!({"input": {"sources": [
+            {"name": "target", "profile": "rust", "source": {"kind": "git", "url": "https://x/y"}}
+        ]}});
+        match sandbox
+            .create_run("job-1", "tenant", JobKind::Check, &spec)
+            .await
+        {
+            Err(SandboxError::SourcesNotEnabled) => {}
+            other => panic!("expected SourcesNotEnabled, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_named_source_profile_the_image_lacks_is_refused_before_any_pod() {
+        let mut pairs = base_pairs();
+        pairs.push((MULTI_SOURCE_ENV, "1"));
+        pairs.push((PROFILES_ENV, "rust"));
+        let sandbox = Sandbox::new(config_with(&pairs)).expect("client");
+        let spec = serde_json::json!({"input": {"sources": [
+            {"name": "target", "profile": "rust", "source": {"kind": "git", "url": "https://x/y"}},
+            {"name": "source-1", "profile": "python", "source": {"kind": "git", "url": "https://x/z"}}
+        ]}});
+        match sandbox
+            .create_run("job-1", "tenant", JobKind::Check, &spec)
+            .await
+        {
+            Err(SandboxError::ProfileNotEnabled { requested, .. }) => {
+                assert_eq!(requested, "python");
+            }
+            other => panic!("expected ProfileNotEnabled, got {other:?}"),
+        }
     }
 }
