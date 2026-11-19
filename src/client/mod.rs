@@ -62,6 +62,9 @@ pub struct CheckArgs {
     pub url: Option<String>,
     /// `--tenant` or `CODING_TENANT`, default `local`.
     pub tenant: Option<String>,
+    /// The licence bearer token. `--token` or `CODING_TOKEN`, then `git config coding.token`.
+    /// Never printed and never passed on a command line by the hooks.
+    pub token: Option<String>,
     pub kind: JobKind,
     /// `--profile`; `auto` (the default) detects the toolchain from the packed tree.
     pub profile: ProfileArg,
@@ -125,6 +128,9 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
             ClientError::Usage(format!("cannot read the working directory: {err}"))
         })?,
     };
+    // The hook body never passes a token on the command line (it would be visible in `ps`);
+    // the CLI reads `coding.token` from the same git config the hook already uses.
+    let token = resolve_token(args.token.clone(), git_config(&dir, "coding.token"));
 
     let tree = pack::collect(&dir).map_err(|err| match err {
         pack::PackError::Usage(message) => ClientError::Usage(message),
@@ -173,12 +179,15 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     //    starts, and a tunnel is not ready the instant it prints — one attempt would report
     //    "cannot reach the app" for a tunnel that is fine a second later.
     let upload = send_with_retry(|| {
-        client
-            .post(format!("{base}/api/sources"))
-            .header("x-tenant-id", &tenant)
-            .header(reqwest::header::CONTENT_TYPE, "application/gzip")
-            .timeout(UPLOAD_TIMEOUT)
-            .body(blob.clone())
+        authorize(
+            client
+                .post(format!("{base}/api/sources"))
+                .header("x-tenant-id", &tenant)
+                .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+                .timeout(UPLOAD_TIMEOUT)
+                .body(blob.clone()),
+            token.as_deref(),
+        )
     })
     .await?;
     let upload = read_json(upload).await?;
@@ -203,10 +212,13 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
         "timeout_seconds": args.timeout_seconds,
     });
     let created = send_with_retry(|| {
-        client
-            .post(format!("{base}/api/jobs"))
-            .header("x-tenant-id", &tenant)
-            .json(&request)
+        authorize(
+            client
+                .post(format!("{base}/api/jobs"))
+                .header("x-tenant-id", &tenant)
+                .json(&request),
+            token.as_deref(),
+        )
     })
     .await?;
     let created = read_json(created).await?;
@@ -218,17 +230,27 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     println!("job {job_id} {}", created_status(&created));
 
     // 3. Poll to a verdict, or cancel on Ctrl-C.
-    let poll = poll_to_verdict(&client, &base, &tenant, &job_id, args.timeout_seconds);
+    let poll = poll_to_verdict(
+        &client,
+        &base,
+        &tenant,
+        &job_id,
+        args.timeout_seconds,
+        token.as_deref(),
+    );
     tokio::pin!(poll);
     let job = tokio::select! {
         result = &mut poll => result?,
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\ninterrupted: asking the app to cancel job {job_id}");
-            let _ = client
-                .post(format!("{base}/api/jobs/{job_id}/cancel"))
-                .header("x-tenant-id", &tenant)
-                .send()
-                .await;
+            let _ = authorize(
+                client
+                    .post(format!("{base}/api/jobs/{job_id}/cancel"))
+                    .header("x-tenant-id", &tenant),
+                token.as_deref(),
+            )
+            .send()
+            .await;
             return Ok(EXIT_INTERRUPTED);
         }
     };
@@ -264,6 +286,41 @@ fn resolve_url(flag: Option<&str>, env: Option<String>) -> Result<String, Client
         ));
     }
     Ok(raw.trim_end_matches('/').to_owned())
+}
+
+/// The licence bearer, if one was supplied. `--token`/CODING_TOKEN wins over `git config
+/// coding.token`; a blank value is treated as absent so an empty config cannot send `Bearer `.
+fn resolve_token(flag: Option<String>, git_config_value: Option<String>) -> Option<String> {
+    [flag, git_config_value]
+        .into_iter()
+        .flatten()
+        .map(|token| token.trim().to_owned())
+        .find(|token| !token.is_empty())
+}
+
+/// Read one git config value from `dir`. Any failure is `None`: the token is optional, and a
+/// missing git or a missing key must not turn an unauthenticated call into an error.
+fn git_config(dir: &std::path::Path, key: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", key])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!value.is_empty()).then_some(value)
+}
+
+/// Add the licence bearer when one is configured. In-cluster callers send no token and keep the
+/// exact requests they sent before this existed.
+fn authorize(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token {
+        Some(token) => request.header(reqwest::header::AUTHORIZATION, format!("Bearer {token}")),
+        None => request,
+    }
 }
 
 /// How many attempts a request that has not reach the app yet gets.
@@ -338,6 +395,7 @@ async fn poll_to_verdict(
     tenant: &str,
     job_id: &str,
     timeout_seconds: u32,
+    token: Option<&str>,
 ) -> Result<Value, ClientError> {
     let started = std::time::Instant::now();
     let budget = Duration::from_secs(u64::from(timeout_seconds) + 120);
@@ -347,11 +405,14 @@ async fn poll_to_verdict(
         // A failed *read* is transient by nature — the tunnel can blip — so it is reported once
         // and the loop keeps going until its budget runs out. A refusal from the app still ends
         // the poll at once through read_json, because that is the app answering.
-        match client
-            .get(format!("{base}/api/jobs/{job_id}"))
-            .header("x-tenant-id", tenant)
-            .send()
-            .await
+        match authorize(
+            client
+                .get(format!("{base}/api/jobs/{job_id}"))
+                .header("x-tenant-id", tenant),
+            token,
+        )
+        .send()
+        .await
         {
             Ok(response) => {
                 let job = read_json(response).await?;
@@ -677,5 +738,45 @@ mod tests {
             resolve_url(Some("ftp://x"), None).unwrap_err(),
             ClientError::Usage(_)
         ));
+    }
+
+    #[test]
+    fn the_token_prefers_the_flag_then_git_config_and_ignores_blanks() {
+        assert_eq!(
+            resolve_token(Some(" flag ".to_owned()), Some("git".to_owned())).as_deref(),
+            Some("flag")
+        );
+        assert_eq!(
+            resolve_token(None, Some("git".to_owned())).as_deref(),
+            Some("git")
+        );
+        assert_eq!(
+            resolve_token(Some("   ".to_owned()), Some("git".to_owned())).as_deref(),
+            Some("git"),
+            "a blank flag must not mask a configured token"
+        );
+        assert_eq!(resolve_token(None, Some("  ".to_owned())), None);
+        assert_eq!(resolve_token(None, None), None);
+    }
+
+    #[test]
+    fn the_authorization_header_is_only_added_when_a_token_exists() {
+        let client = reqwest::Client::new();
+        let with = authorize(client.get("http://127.0.0.1:1/health"), Some("t"))
+            .build()
+            .unwrap();
+        assert_eq!(
+            with.headers().get(reqwest::header::AUTHORIZATION).unwrap(),
+            "Bearer t"
+        );
+        let without = authorize(client.get("http://127.0.0.1:1/health"), None)
+            .build()
+            .unwrap();
+        assert!(
+            without
+                .headers()
+                .get(reqwest::header::AUTHORIZATION)
+                .is_none()
+        );
     }
 }
