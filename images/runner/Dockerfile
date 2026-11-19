@@ -63,6 +63,27 @@ RUN apt-get update \
     && tar -xzf /tmp/sccache.tar.gz -C /tmp \
     && install -D -m 0755 "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /out/sccache
 
+# cargo-nextest: the Rust test plan's runner. `cargo test` runs a workspace's test binaries one at
+# a time; on `conveyor` (266 integration-test files) that is 894 s and two 1800 s timeouts against
+# about 170 s under nextest, with the compilation cache warm in both cases.
+#
+# Pinned to 0.9.150 with the SAME url and sha256 the Rust CI workflow installs
+# (.github/workflows/ci-public.yml), so the gate and CI cannot drift onto different runners.
+FROM debian:12-slim AS nextest
+ARG NEXTEST_VERSION=cargo-nextest-0.9.150
+# sha256 of cargo-nextest-0.9.150-x86_64-unknown-linux-gnu.tar.gz
+ARG NEXTEST_SHA256=b0959bc64232974224cf9fb22c915845398c0e8668fa7831eb5b43fb1eef781f
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors \
+        -o /tmp/nextest.tar.gz \
+        "https://github.com/nextest-rs/nextest/releases/download/${NEXTEST_VERSION}/${NEXTEST_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+    && echo "${NEXTEST_SHA256}  /tmp/nextest.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/nextest.tar.gz -C /tmp cargo-nextest \
+    && install -D -m 0755 /tmp/cargo-nextest /out/cargo-nextest
+
 # The runtime stage is `postgres:18` because the runner starts a throwaway Postgres 18 from it
 # (src/runner/postgres.rs). It has to be THIS base: those binaries are built for the image's
 # own Debian (trixie, ICU 76), and copying them onto a bookworm base fails on missing shared
@@ -98,6 +119,7 @@ COPY --from=build /opt/cargo/bin /opt/cargo/bin
 COPY --from=build /out/coding-runner /usr/local/bin/coding-runner
 # The compilation cache's client. Its endpoint and credentials arrive per job, never from here.
 COPY --from=sccache /out/sccache /usr/local/bin/sccache
+COPY --from=nextest /out/cargo-nextest /usr/local/bin/cargo-nextest
 
 # The Python profile's toolchain: uv (the public archetype's version) and one CPython it manages.
 # The interpreter is read-only here and `coding-runner` points uv at it
@@ -121,6 +143,7 @@ RUN /opt/cargo/bin/rustc --version \
     && pg_ctl --version \
     && redis-server --version \
     && sccache --version \
+    && cargo-nextest --version \
     && test -f /usr/share/postgresql/18/postgres.bki
 
 # No WORKDIR under a read-only root; the runner creates /tmp/src itself.
