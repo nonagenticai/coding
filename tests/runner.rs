@@ -104,9 +104,14 @@ async fn a_passing_crate_reports_succeeded_with_an_exit_code() {
     )
     .await;
     assert_eq!(result.status, Status::Succeeded, "{result:?}");
-    assert_eq!(result.checks.len(), 1);
-    assert_eq!(result.checks[0].name, "cargo test");
-    assert_eq!(result.checks[0].exit_code, Some(0));
+    assert_eq!(
+        result.checks.len(),
+        2,
+        "doctests, then the suite: {result:?}"
+    );
+    assert_eq!(result.checks[0].name, "cargo test --doc");
+    assert_eq!(result.checks[1].name, "cargo nextest");
+    assert_eq!(result.checks[1].exit_code, Some(0));
     assert!(result.source.is_some());
 }
 
@@ -121,9 +126,16 @@ async fn a_failing_crate_is_a_failed_result_not_a_crash() {
     )
     .await;
     assert_eq!(result.status, Status::Failed, "{result:?}");
-    assert_eq!(result.checks.len(), 1);
-    // cargo test exits 101 on a failing test.
-    assert_eq!(result.checks[0].exit_code, Some(101));
+    assert_eq!(
+        result.checks.len(),
+        2,
+        "doctests, then the suite: {result:?}"
+    );
+    // The doctest run has nothing to check in this crate and passes; the suite is the failure.
+    // ⚠️ nextest exits 100 on a failing test, where `cargo test` exits 101 — the same distinction
+    // cargo draws between a failed test and a failed build, at a different number. Nothing in
+    // the service branches on the value, only on zero/non-zero.
+    assert_eq!(result.checks[1].exit_code, Some(100));
     assert!(
         result.error.is_none(),
         "a failing test is not a setup error"
@@ -157,7 +169,7 @@ async fn the_result_serialises_under_coding_result() {
     .await;
     let value = serde_json::to_value(&result).expect("serialisable");
     assert_eq!(value["status"], "succeeded");
-    assert_eq!(value["checks"][0]["name"], "cargo test");
+    assert_eq!(value["checks"][0]["name"], "cargo test --doc");
 }
 
 /// A `check` job runs all three gates in one Pod, and reports each of them.
@@ -195,12 +207,13 @@ async fn a_failing_check_carries_its_output_tail() {
     )
     .await;
     assert_eq!(result.status, Status::Failed, "{result:?}");
-    let tail = result.checks[0]
+    let tail = result.checks[1]
         .output_tail
         .as_deref()
         .expect("the failing check must carry its tail");
+    // nextest's own framing plus the panic it captured, not a bare summary line.
     assert!(
-        tail.contains("assertion") || tail.contains("panicked"),
+        tail.contains("assertion") || tail.contains("panicked") || tail.contains("FAIL"),
         "the tail is the test output, not a summary: {tail}"
     );
     assert!(
@@ -241,15 +254,18 @@ async fn a_two_source_job_runs_both_plans_and_names_each_check() {
     .await;
 
     assert_eq!(result.status, Status::Failed, "{result:?}");
-    assert_eq!(result.checks.len(), 2, "one test step per source");
+    // The Rust test plan is two steps — doctests, then the suite — so each tree reports two.
+    assert_eq!(result.checks.len(), 4, "two test steps per source");
     assert_eq!(result.checks[0].source.as_deref(), Some("target"));
-    assert_eq!(result.checks[1].source.as_deref(), Some("source-1"));
+    assert_eq!(result.checks[1].source.as_deref(), Some("target"));
+    assert_eq!(result.checks[2].source.as_deref(), Some("source-1"));
+    assert_eq!(result.checks[3].source.as_deref(), Some("source-1"));
     assert_eq!(
         result.checks[0].status,
         coding::runner::result::CheckStatus::Passed
     );
     assert_eq!(
-        result.checks[1].status,
+        result.checks[3].status,
         coding::runner::result::CheckStatus::Failed
     );
     // Both plans ran: the second source's failure did not stop the job from reporting the first.
@@ -438,7 +454,7 @@ async fn an_uploaded_archive_is_fetched_verified_and_unpacked() {
     .await;
 
     assert_eq!(result.status, Status::Succeeded, "{result:?}");
-    assert_eq!(result.checks[0].name, "cargo test");
+    assert_eq!(result.checks[0].name, "cargo test --doc");
     let source = result.source.expect("a result names its source");
     assert_eq!(source.kind, "upload");
     assert_eq!(source.files, 3, "the archive's own file count");
@@ -507,7 +523,7 @@ async fn a_transient_fetch_failure_is_retried() {
         Status::Succeeded,
         "two refused connections must not fail the job: {result:?}"
     );
-    assert_eq!(result.checks[0].name, "cargo test");
+    assert_eq!(result.checks[0].name, "cargo test --doc");
 }
 
 #[tokio::test]
