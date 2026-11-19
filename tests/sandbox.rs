@@ -326,9 +326,14 @@ fn manifest_is_restricted_and_carries_the_spec() {
     assert_eq!(spec["volumes"][0]["emptyDir"]["sizeLimit"], "8Gi");
 
     // Per-kind resources: build/test are the larger tier, analyze/scan the smaller one.
+    //
+    // The CPU *limit* is what cargo actually sees: `available_parallelism()` reports the cgroup
+    // quota, so 2 ran at most ~2 rustc jobs on any node. It is raised without raising the
+    // request, because `requests.cpu` is quota-capped at 8 in `coding-runs` (8 concurrent jobs)
+    // while `limits.cpu` is not capped at all. The LimitRange ceiling there is 6 CPU.
     assert_eq!(container["resources"]["requests"]["cpu"], "1");
     assert_eq!(container["resources"]["requests"]["memory"], "2Gi");
-    assert_eq!(container["resources"]["limits"]["cpu"], "2");
+    assert_eq!(container["resources"]["limits"]["cpu"], "4");
     assert_eq!(container["resources"]["limits"]["memory"], "4Gi");
 
     let analyze = sandbox
