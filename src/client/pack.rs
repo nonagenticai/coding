@@ -31,6 +31,7 @@ pub enum Snapshot {
 
 impl Snapshot {
     /// The wire/CLI spelling.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Worktree => "worktree",
@@ -58,11 +59,13 @@ pub struct Tree {
 
 impl Tree {
     /// The unpressed size of the tree.
+    #[must_use]
     pub fn bytes(&self) -> u64 {
         self.files.iter().map(|file| file.data.len() as u64).sum()
     }
 
     /// Whether a file with this path is in the tree.
+    #[must_use]
     pub fn has(&self, path: &str) -> bool {
         self.files.iter().any(|file| file.path == path)
     }
@@ -78,6 +81,11 @@ pub enum PackError {
 }
 
 /// Collect `snapshot` of the repository under `dir` (which must be inside a git repository).
+///
+/// # Errors
+///
+/// `PackError::Usage` when `dir` is not inside a git repository or the chosen snapshot has no
+/// files, and `PackError::Io` when a git or filesystem read fails.
 pub fn collect(dir: &Path, snapshot: Snapshot) -> Result<Tree, PackError> {
     let root = git_output(dir, &["rev-parse", "--show-toplevel"])
         .map(PathBuf::from)
@@ -94,9 +102,7 @@ pub fn collect(dir: &Path, snapshot: Snapshot) -> Result<Tree, PackError> {
 
 /// The historical snapshot: tracked files read from disk plus untracked-not-ignored files.
 fn collect_worktree(root: &Path, head: Option<String>) -> Result<Tree, PackError> {
-    let dirty = !git_output(root, &["status", "--porcelain"])
-        .map(|status| status.is_empty())
-        .unwrap_or(false);
+    let dirty = !git_output(root, &["status", "--porcelain"]).is_ok_and(|status| status.is_empty());
 
     let listing = git_bytes(root, &["ls-files", "-z", "-c", "-o", "--exclude-standard"])
         .map_err(|err| PackError::Io(format!("git ls-files failed: {err}")))?;
@@ -117,11 +123,10 @@ fn collect_worktree(root: &Path, head: Option<String>) -> Result<Tree, PackError
             continue;
         }
         let full = root.join(&path);
-        let metadata = match std::fs::symlink_metadata(&full) {
-            Ok(metadata) => metadata,
-            // A path listed by git but gone from the working tree (deleted, not staged) is not
-            // something a check needs; skip it rather than fail the whole run.
-            Err(_) => continue,
+        // A path listed by git but gone from the working tree (deleted, not staged) is not
+        // something a check needs; skip it rather than fail the whole run.
+        let Ok(metadata) = std::fs::symlink_metadata(&full) else {
+            continue;
         };
         if !metadata.file_type().is_file() {
             skipped_irregular.push(path);
@@ -378,15 +383,24 @@ fn git_exit(dir: &Path, args: &[&str]) -> Option<i32> {
 /// stop the obvious accident, not to classify every possible secret.
 fn is_secret_shaped(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
-    name == ".env"
-        || name.starts_with(".env.")
-        || name.ends_with(".pem")
-        || name.ends_with(".key")
-        || name.ends_with(".p12")
-        || name.ends_with(".pfx")
-        || name.starts_with("id_rsa")
-        || name.starts_with("id_ed25519")
-        || name.starts_with("id_ecdsa")
+    let lower = name.to_ascii_lowercase();
+    // A dotfile whose whole name is a secret-shaped suffix (`.pem`) has no
+    // `Path::extension`; the string form must stay, or the file would travel.
+    if matches!(lower.as_str(), ".pem" | ".key" | ".p12" | ".pfx") {
+        return true;
+    }
+    let extension = Path::new(name).extension();
+    let has_extension =
+        |wanted: &str| extension.is_some_and(|ext| ext.eq_ignore_ascii_case(wanted));
+    lower == ".env"
+        || lower.starts_with(".env.")
+        || has_extension("pem")
+        || has_extension("key")
+        || has_extension("p12")
+        || has_extension("pfx")
+        || lower.starts_with("id_rsa")
+        || lower.starts_with("id_ed25519")
+        || lower.starts_with("id_ecdsa")
 }
 
 #[cfg(unix)]
@@ -421,6 +435,11 @@ fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 /// Pack a collected tree into the archive the API accepts.
+///
+/// # Errors
+///
+/// `PackError::Io` when a path fails archive validation, the archive exceeds the compressed
+/// size cap, or the gzip/tar encoding fails.
 pub fn pack(tree: &Tree) -> Result<Vec<u8>, PackError> {
     source_archive::pack(&tree.files).map_err(|err| PackError::Io(err.to_string()))
 }
@@ -436,6 +455,8 @@ mod tests {
             ".env.local",
             "certs/server.pem",
             "private.key",
+            ".pem",
+            "private.PEM",
             "id_rsa",
             "id_ed25519.pub",
         ] {

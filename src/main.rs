@@ -5,7 +5,7 @@
 //! - `worker`: run the job worker loop;
 //! - `check`: pack this working tree, run it in a kata Pod, print the verdict and exit with it;
 //! - `hook install|uninstall`: a git hook that runs `check` (fails open);
-//! - `--print-openapi`: write the OpenAPI JSON to stdout and exit without reading any env or
+//! - `--print-openapi`: write the `OpenAPI` JSON to stdout and exit without reading any env or
 //!   touching a database (the parity tooling runs it in a bare workspace).
 
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ use coding::{AppState, app, db, openapi, telemetry, worker};
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Print the OpenAPI document as JSON to stdout and exit.
+    /// Print the `OpenAPI` document as JSON to stdout and exit.
     #[arg(long)]
     print_openapi: bool,
     #[command(subcommand)]
@@ -69,13 +69,13 @@ impl From<KindArg> for JobKind {
 
 #[derive(Debug, clap::Args)]
 struct CheckCmd {
-    /// The app's base URL. Falls back to CODING_URL.
+    /// The app's base URL. Falls back to `CODING_URL`.
     #[arg(long)]
     url: Option<String>,
-    /// The tenant to attribute the job to. Falls back to CODING_TENANT, then `local`.
+    /// The tenant to attribute the job to. Falls back to `CODING_TENANT`, then `local`.
     #[arg(long)]
     tenant: Option<String>,
-    /// The licence bearer token. Falls back to CODING_TOKEN, then `git config coding.token`.
+    /// The licence bearer token. Falls back to `CODING_TOKEN`, then `git config coding.token`.
     #[arg(long, env = "CODING_TOKEN")]
     token: Option<String>,
     #[arg(long, value_enum, default_value_t = KindArg::Check)]
@@ -226,9 +226,7 @@ fn run_hook(cmd: HookCmd) -> ExitCode {
             dir: flag_dir,
         } => {
             let dir = flag_dir.unwrap_or(dir);
-            let kind = kind
-                .map(JobKind::from)
-                .unwrap_or_else(|| hook.default_job());
+            let kind = kind.map_or_else(|| hook.default_job(), JobKind::from);
             client::hook::install(&dir, hook.kind(), kind, force)
                 .map(|path| format!("installed {}", path.display()))
         }

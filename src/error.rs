@@ -5,7 +5,7 @@
 //! ```
 //!
 //! This is deliberately NOT the template's FastAPI-style `{"detail": "..."}`: the new API is a
-//! fresh contract (see the plan), and every caller is generated from the OpenAPI document.
+//! fresh contract (see the plan), and every caller is generated from the `OpenAPI` document.
 
 use axum::Json;
 use axum::http::StatusCode;

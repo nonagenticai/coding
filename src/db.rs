@@ -10,6 +10,12 @@ use sqlx::postgres::PgPoolOptions;
 /// `migrations/*.sql`, embedded into the binary at compile time (no DB needed to build).
 pub static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+/// Connect the runtime pool to `url`.
+///
+/// # Errors
+///
+/// `sqlx::Error` when the URL is invalid or no connection can be acquired within the pool's
+/// acquire timeout.
 pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
         .max_connections(10)
@@ -18,6 +24,12 @@ pub async fn connect(url: &str) -> Result<PgPool, sqlx::Error> {
         .await
 }
 
+/// Apply the embedded migrations to `pool`.
+///
+/// # Errors
+///
+/// `MigrateError` when a migration fails or when the database's applied set conflicts with
+/// the embedded set (a changed or missing checksum).
 pub async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
     MIGRATOR.run(pool).await
 }

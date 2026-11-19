@@ -310,6 +310,13 @@ fn invalid_spec(message: String) -> JobError {
 ///   the bounded log tail.
 /// - `Failed` -> `runner_failed`, non-retryable, with the bounded log as details.
 /// - deadline exceeded -> `timeout`, retryable.
+///
+/// # Errors
+///
+/// `JobError` with `source_unavailable`, `github_app_error` or `invalid_job_spec` when the
+/// input cannot be prepared, with a `sandbox_*` code when the Pod cannot be created, and with
+/// `runner_failed`, `pod_gone`, `timeout` or `cancelled` from the pod poll. A failed Pod
+/// delete is logged, not returned.
 pub async fn execute_sandbox(
     sandbox: &Sandbox,
     pool: &PgPool,
@@ -333,7 +340,7 @@ pub async fn execute_sandbox(
     let pod = sandbox
         .create_run(&claim.id, &claim.tenant_id, claim.kind, &spec)
         .await
-        .map_err(sandbox_job_error)?;
+        .map_err(|error| sandbox_job_error(&error))?;
 
     let outcome = poll_pod(sandbox, pool, &claim, &pod).await;
 
@@ -357,7 +364,10 @@ async fn poll_pod(
     pod: &str,
 ) -> Result<Value, JobError> {
     let timeout_seconds = claim.timeout_seconds;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds.max(0) as u64);
+    // `max(0)` is non-negative, so the conversion cannot fail; a negative column would be a
+    // database bug and is clamped rather than wrapping.
+    let clamped = u64::try_from(timeout_seconds.max(0)).expect("clamped to non-negative");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(clamped);
     loop {
         // A cancel is checked on every tick, so the Pod dies within one interval rather than
         // running to its deadline. The caller sees `cancelled` and `execute_claim` records the
@@ -479,8 +489,8 @@ fn result_from_log(log: &str, exit_code: Option<i32>) -> Result<Value, String> {
 
 /// Map a sandbox failure onto the job envelope. Manifest and configuration errors are
 /// permanent; transport and API failures may succeed on a retry.
-fn sandbox_job_error(error: SandboxError) -> JobError {
-    let (code, retryable) = match &error {
+fn sandbox_job_error(error: &SandboxError) -> JobError {
+    let (code, retryable) = match error {
         SandboxError::Missing(_)
         | SandboxError::Invalid { .. }
         | SandboxError::Credential(_)
@@ -508,6 +518,11 @@ fn sandbox_job_error(error: SandboxError) -> JobError {
 ///
 /// The sandbox is built before the loop starts: an unset namespace or a non-digest-pinned
 /// image is a startup failure, never a stream of failing jobs.
+///
+/// # Errors
+///
+/// `AppError::Unavailable` when the sandbox environment is unset or invalid, or when the
+/// `GitHub` App configuration is present but broken.
 pub async fn run(
     pool: PgPool,
     worker_id: impl Into<String>,
@@ -549,6 +564,11 @@ pub async fn run(
 }
 
 /// The loop with explicit timings and a substitutable executor (the integration tests use both).
+///
+/// # Errors
+///
+/// Currently never: the loop drains and returns `Ok`, so the `Result` is kept for future
+/// startup checks rather than for a failure that exists today.
 pub async fn run_with(
     pool: PgPool,
     worker_id: impl Into<String>,
@@ -561,6 +581,11 @@ pub async fn run_with(
 
 /// [`run_with`] plus the orphan-Pod reaper. A Pod outlives its job when the worker dies between
 /// creating it and deleting it, so the production path must reap by age as well as by outcome.
+///
+/// # Errors
+///
+/// Currently never: the loop drains and returns `Ok`, so the `Result` is kept for future
+/// startup checks rather than for a failure that exists today.
 pub async fn run_with_sandbox(
     pool: PgPool,
     worker_id: impl Into<String>,
@@ -816,14 +841,14 @@ async fn reap_loop(pool: PgPool, period: Duration) {
         ticker.tick().await;
         match store::reap_cancelled(&pool).await {
             Ok(count) if count > 0 => {
-                tracing::info!(count, "reaper: expired cancelled jobs marked terminal")
+                tracing::info!(count, "reaper: expired cancelled jobs marked terminal");
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(error = %error, "reaper: cancelled sweep failed"),
         }
         match store::reap_expired(&pool).await {
             Ok((requeued, failed)) if requeued + failed > 0 => {
-                tracing::info!(requeued, failed, "reaper: reclaimed abandoned leases")
+                tracing::info!(requeued, failed, "reaper: reclaimed abandoned leases");
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(error = %error, "reaper: lease sweep failed"),
@@ -832,7 +857,7 @@ async fn reap_loop(pool: PgPool, period: Duration) {
         // recovered job never loses the archive its retry still needs.
         match store::reap_sources(&pool, SOURCE_RETENTION_SECONDS).await {
             Ok(count) if count > 0 => {
-                tracing::info!(count, "reaper: deleted unreferenced source uploads")
+                tracing::info!(count, "reaper: deleted unreferenced source uploads");
             }
             Ok(_) => {}
             Err(error) => tracing::warn!(error = %error, "reaper: source sweep failed"),
@@ -881,7 +906,7 @@ mod tests {
         format!("http://{addr}")
     }
 
-    fn claim_with(source: serde_json::Value) -> JobClaim {
+    fn claim_with(source: &serde_json::Value) -> JobClaim {
         JobClaim {
             id: "11111111-1111-4111-8111-111111111111".to_owned(),
             tenant_id: "t".to_owned(),
@@ -912,7 +937,7 @@ mod tests {
     async fn a_github_clone_gets_an_installation_token() {
         let api = github_api("ghs_from_the_app").await;
         let app = GitHubApp::with_signer("2333879", "12345678", &api, |_| Ok(vec![1u8; 256]));
-        let claim = claim_with(json!({"kind": "git", "url": "https://github.com/o/r.git"}));
+        let claim = claim_with(&json!({"kind": "git", "url": "https://github.com/o/r.git"}));
         let token = git_token(Some(&app), &claim.input["source"])
             .await
             .expect("mints");
@@ -933,7 +958,7 @@ mod tests {
             "https://evil.example/github.com/o/r.git",
             "https://github.com.evil.example/o/r.git",
         ] {
-            let claim = claim_with(json!({"kind": "git", "url": url}));
+            let claim = claim_with(&json!({"kind": "git", "url": url}));
             let token = git_token(Some(&app), &claim.input["source"])
                 .await
                 .expect("passes through");
@@ -943,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_app_means_an_anonymous_clone_not_a_failure() {
-        let claim = claim_with(json!({"kind": "git", "url": "https://github.com/o/r.git"}));
+        let claim = claim_with(&json!({"kind": "git", "url": "https://github.com/o/r.git"}));
         let token = git_token(None, &claim.input["source"])
             .await
             .expect("unchanged");
@@ -956,7 +981,7 @@ mod tests {
         let app = GitHubApp::with_signer("2333879", "12345678", &api, |_| Ok(vec![1u8; 256]));
         // `claim_with` wraps its argument as the single `source`; this job's input is the
         // multi-source form, so the claim is built and its input replaced.
-        let mut claim = claim_with(json!({"kind": "git", "url": "https://github.com/o/unused"}));
+        let mut claim = claim_with(&json!({"kind": "git", "url": "https://github.com/o/unused"}));
         claim.input = json!({"sources": [
             {"name": "target", "profile": "rust",
              "source": {"kind": "git", "url": "https://github.com/o/target-rs"}},

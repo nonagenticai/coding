@@ -73,6 +73,12 @@ const JOB_COLUMNS: &str = r#"
 "#;
 
 /// Create a job. A repeated `idempotency_key` for the same tenant returns the original job.
+///
+/// # Errors
+///
+/// `AppError::NotFound` when `workspace_id` is not owned by the tenant, `AppError::Conflict`
+/// when the insert conflicts but no `idempotency_key` was supplied, `AppError::Unavailable`
+/// when the stored row cannot be decoded, and `AppError::Database` when Postgres fails.
 pub async fn create_job(
     pool: &PgPool,
     tenant: &str,
@@ -96,12 +102,12 @@ pub async fn create_job(
     }
 
     let sql = format!(
-        r#"
+        r"
         INSERT INTO jobs (tenant_id, kind, workspace_id, input, idempotency_key, timeout_seconds)
         VALUES ($1, $2, $3::uuid, $4, $5, $6)
         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
         RETURNING {JOB_COLUMNS}
-        "#
+        "
     );
     let inserted: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(tenant)
@@ -113,26 +119,30 @@ pub async fn create_job(
         .fetch_optional(pool)
         .await?;
 
-    let row = match inserted {
-        Some(row) => row,
-        None => {
-            let key = idempotency_key.ok_or_else(|| {
-                AppError::Conflict("insert conflicted but no idempotency_key was supplied".into())
-            })?;
-            let sql = format!(
-                "SELECT {JOB_COLUMNS} FROM jobs WHERE tenant_id = $1 AND idempotency_key = $2"
-            );
-            sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(sql))
-                .bind(tenant)
-                .bind(key)
-                .fetch_one(pool)
-                .await?
-        }
+    let row = if let Some(row) = inserted {
+        row
+    } else {
+        let key = idempotency_key.ok_or_else(|| {
+            AppError::Conflict("insert conflicted but no idempotency_key was supplied".into())
+        })?;
+        let sql =
+            format!("SELECT {JOB_COLUMNS} FROM jobs WHERE tenant_id = $1 AND idempotency_key = $2");
+        sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(sql))
+            .bind(tenant)
+            .bind(key)
+            .fetch_one(pool)
+            .await?
     };
     Job::try_from(row)
 }
 
 /// Read one job, tenant-scoped.
+///
+/// # Errors
+///
+/// `AppError::BadRequest` for an id that is not a UUID, `AppError::NotFound` when the tenant
+/// does not own the job, `AppError::Unavailable` when the row cannot be decoded, and
+/// `AppError::Database` when the query fails.
 pub async fn get_job(pool: &PgPool, tenant: &str, id: &str) -> Result<Job, AppError> {
     let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = $2::uuid AND tenant_id = $1");
     let row = sqlx::query_as::<_, JobRow>(sqlx::AssertSqlSafe(sql))
@@ -151,16 +161,21 @@ pub async fn get_job(pool: &PgPool, tenant: &str, id: &str) -> Result<Job, AppEr
 }
 
 /// Ask a queued job to stop. Terminal jobs are returned unchanged.
+///
+/// # Errors
+///
+/// `AppError::Database` when the update fails, plus every error [`get_job`] returns for a job
+/// that is already terminal or unknown.
 pub async fn cancel_job(pool: &PgPool, tenant: &str, id: &str) -> Result<Job, AppError> {
     let sql = format!(
-        r#"
+        r"
         UPDATE jobs
         SET cancel_requested = true,
             status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE status END,
             finished_at = CASE WHEN status = 'queued' THEN now() ELSE finished_at END
         WHERE id = $2::uuid AND tenant_id = $1 AND status IN ('queued', 'running')
         RETURNING {JOB_COLUMNS}
-        "#
+        "
     );
     let updated: Option<JobRow> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
         .bind(tenant)
@@ -188,6 +203,7 @@ impl LeaseOwner {
         Self(value.into())
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -234,13 +250,18 @@ struct ClaimRow {
 /// The owner is minted in the same statement — `worker_id/gen_random_uuid()` — so two claims by
 /// the same process never share a fencing token, and a stale slot cannot heartbeat, complete,
 /// fail or cancel a job after the reaper has handed it to a new claim.
+///
+/// # Errors
+///
+/// `AppError::Database` when the claim query fails, and `AppError::Unavailable` when the
+/// claimed row carries a job kind this build does not know.
 pub async fn claim_job(
     pool: &PgPool,
     worker_id: &str,
     lease_seconds: i64,
 ) -> Result<Option<JobClaim>, AppError> {
     let row: Option<ClaimRow> = sqlx::query_as(
-        r#"
+        r"
         UPDATE jobs
         SET status = 'running',
             lease_owner = $1 || '/' || gen_random_uuid()::text,
@@ -256,7 +277,7 @@ pub async fn claim_job(
         )
         RETURNING id::text, tenant_id, kind, workspace_id::text, input, timeout_seconds::bigint,
                   attempts, lease_owner
-        "#,
+        ",
     )
     .bind(worker_id)
     .bind(lease_seconds)
@@ -292,6 +313,10 @@ pub async fn claim_job(
 }
 
 /// Extend the lease. Returns false when this claim no longer owns the job.
+///
+/// # Errors
+///
+/// `AppError::Database` when the update fails.
 pub async fn heartbeat(
     pool: &PgPool,
     owner: &LeaseOwner,
@@ -299,10 +324,10 @@ pub async fn heartbeat(
     lease_seconds: i64,
 ) -> Result<bool, AppError> {
     let result = sqlx::query(
-        r#"
+        r"
         UPDATE jobs SET lease_expires_at = now() + make_interval(secs => $3)
         WHERE id = $1::uuid AND lease_owner = $2 AND status = 'running'
-        "#,
+        ",
     )
     .bind(id)
     .bind(owner.as_str())
@@ -313,6 +338,10 @@ pub async fn heartbeat(
 }
 
 /// Mark a claimed job succeeded. Only its current owner may do so.
+///
+/// # Errors
+///
+/// `AppError::Database` when the update fails.
 pub async fn complete_job(
     pool: &PgPool,
     owner: &LeaseOwner,
@@ -320,12 +349,12 @@ pub async fn complete_job(
     result: &Value,
 ) -> Result<bool, AppError> {
     let outcome = sqlx::query(
-        r#"
+        r"
         UPDATE jobs
         SET status = 'succeeded', result = $3, error = NULL,
             finished_at = now(), lease_owner = NULL, lease_expires_at = NULL
         WHERE id = $1::uuid AND lease_owner = $2 AND status = 'running'
-        "#,
+        ",
     )
     .bind(id)
     .bind(owner.as_str())
@@ -336,6 +365,11 @@ pub async fn complete_job(
 }
 
 /// Mark a claimed job failed.
+///
+/// # Errors
+///
+/// `AppError::Unavailable` when the error payload cannot be serialized, and
+/// `AppError::Database` when the update fails.
 pub async fn fail_job(
     pool: &PgPool,
     owner: &LeaseOwner,
@@ -345,12 +379,12 @@ pub async fn fail_job(
     let payload = serde_json::to_value(error)
         .map_err(|e| AppError::Unavailable(format!("cannot serialize job error: {e}")))?;
     let outcome = sqlx::query(
-        r#"
+        r"
         UPDATE jobs
         SET status = 'failed', error = $3,
             finished_at = now(), lease_owner = NULL, lease_expires_at = NULL
         WHERE id = $1::uuid AND lease_owner = $2 AND status = 'running'
-        "#,
+        ",
     )
     .bind(id)
     .bind(owner.as_str())
@@ -362,16 +396,20 @@ pub async fn fail_job(
 
 /// Has this claim been asked to cancel? Losing the lease reads as `false`: the completion call
 /// is rejected anyway, so the answer cannot decide an outcome by itself.
+///
+/// # Errors
+///
+/// `AppError::Database` when the read fails.
 pub async fn cancel_requested(
     pool: &PgPool,
     owner: &LeaseOwner,
     id: &str,
 ) -> Result<bool, AppError> {
     let row: Option<(bool,)> = sqlx::query_as(
-        r#"
+        r"
         SELECT cancel_requested FROM jobs
         WHERE id = $1::uuid AND lease_owner = $2 AND status = 'running'
-        "#,
+        ",
     )
     .bind(id)
     .bind(owner.as_str())
@@ -381,14 +419,18 @@ pub async fn cancel_requested(
 }
 
 /// Finish a claimed job as `cancelled`. Only its current owner may do so.
+///
+/// # Errors
+///
+/// `AppError::Database` when the update fails.
 pub async fn cancel_claimed(pool: &PgPool, owner: &LeaseOwner, id: &str) -> Result<bool, AppError> {
     let outcome = sqlx::query(
-        r#"
+        r"
         UPDATE jobs
         SET status = 'cancelled', finished_at = now(),
             lease_owner = NULL, lease_expires_at = NULL
         WHERE id = $1::uuid AND lease_owner = $2 AND status = 'running'
-        "#,
+        ",
     )
     .bind(id)
     .bind(owner.as_str())
@@ -398,20 +440,24 @@ pub async fn cancel_claimed(pool: &PgPool, owner: &LeaseOwner, id: &str) -> Resu
 }
 
 /// Requeue jobs whose lease expired with attempts left; fail the rest. Returns (requeued, failed).
+///
+/// # Errors
+///
+/// `AppError::Database` when either update fails.
 pub async fn reap_expired(pool: &PgPool) -> Result<(u64, u64), AppError> {
     let requeued = sqlx::query(
-        r#"
+        r"
         UPDATE jobs
         SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL
         WHERE status = 'running' AND lease_expires_at < now() AND attempts < max_attempts
-        "#,
+        ",
     )
     .execute(pool)
     .await?
     .rows_affected();
 
     let failed = sqlx::query(
-        r#"
+        r"
         UPDATE jobs
         SET status = 'failed', finished_at = now(), lease_owner = NULL, lease_expires_at = NULL,
             error = jsonb_build_object(
@@ -419,7 +465,7 @@ pub async fn reap_expired(pool: &PgPool) -> Result<(u64, u64), AppError> {
                 'message', 'the worker stopped heartbeating and the attempt budget is spent',
                 'retryable', false)
         WHERE status = 'running' AND lease_expires_at < now() AND attempts >= max_attempts
-        "#,
+        ",
     )
     .execute(pool)
     .await?
@@ -433,14 +479,18 @@ pub async fn reap_expired(pool: &PgPool) -> Result<(u64, u64), AppError> {
 /// Run this BEFORE [`reap_expired`]. Otherwise the requeue would put such a job back to
 /// `queued`, and [`claim_job`] skips `cancel_requested` rows forever — the job would never be
 /// claimed and never reach a terminal state.
+///
+/// # Errors
+///
+/// `AppError::Database` when the update fails.
 pub async fn reap_cancelled(pool: &PgPool) -> Result<u64, AppError> {
     let outcome = sqlx::query(
-        r#"
+        r"
         UPDATE jobs
         SET status = 'cancelled', finished_at = now(),
             lease_owner = NULL, lease_expires_at = NULL
         WHERE status = 'running' AND lease_expires_at < now() AND cancel_requested = true
-        "#,
+        ",
     )
     .execute(pool)
     .await?;
@@ -448,6 +498,10 @@ pub async fn reap_cancelled(pool: &PgPool) -> Result<u64, AppError> {
 }
 
 /// Append an event. `seq` is allocated per job; the SSE reader tails by `seq`.
+///
+/// # Errors
+///
+/// `AppError::Database` when the insert fails.
 pub async fn append_event(
     pool: &PgPool,
     job_id: &str,
@@ -455,13 +509,13 @@ pub async fn append_event(
     payload: &Value,
 ) -> Result<(), AppError> {
     sqlx::query(
-        r#"
+        r"
         INSERT INTO job_events (job_id, seq, kind, payload)
         VALUES (
             $1::uuid,
             COALESCE((SELECT max(seq) + 1 FROM job_events WHERE job_id = $1::uuid), 0),
             $2, $3)
-        "#,
+        ",
     )
     .bind(job_id)
     .bind(kind)
@@ -472,6 +526,10 @@ pub async fn append_event(
 }
 
 /// Events after `after_seq`, oldest first, tenant-scoped through the job.
+///
+/// # Errors
+///
+/// `AppError::Database` when the read fails.
 pub async fn events_since(
     pool: &PgPool,
     tenant: &str,
@@ -480,14 +538,14 @@ pub async fn events_since(
     limit: i64,
 ) -> Result<Vec<(i64, String, Value)>, AppError> {
     let rows: Vec<(i64, String, Value)> = sqlx::query_as(
-        r#"
+        r"
         SELECT e.seq, e.kind, e.payload
         FROM job_events e
         JOIN jobs j ON j.id = e.job_id
         WHERE e.job_id = $2::uuid AND j.tenant_id = $1 AND e.seq > $3
         ORDER BY e.seq
         LIMIT $4
-        "#,
+        ",
     )
     .bind(tenant)
     .bind(job_id)
@@ -499,6 +557,10 @@ pub async fn events_since(
 }
 
 /// Store one uploaded source archive. Returns its id.
+///
+/// # Errors
+///
+/// `AppError::Database` when the insert fails.
 pub async fn create_source(
     pool: &PgPool,
     tenant: &str,
@@ -508,11 +570,11 @@ pub async fn create_source(
     blob: &[u8],
 ) -> Result<String, AppError> {
     let (id,): (String,) = sqlx::query_as(
-        r#"
+        r"
         INSERT INTO sources (tenant_id, sha256, bytes, files, blob)
         VALUES ($1, $2, $3, $4, $5)
         RETURNING id::text
-        "#,
+        ",
     )
     .bind(tenant)
     .bind(sha256)
@@ -525,6 +587,11 @@ pub async fn create_source(
 }
 
 /// Does this tenant own this source? A job may only name a source its own tenant uploaded.
+///
+/// # Errors
+///
+/// `AppError::BadRequest` for an id that is not a UUID, and `AppError::Database` when the
+/// query fails.
 pub async fn owns_source(pool: &PgPool, tenant: &str, id: &str) -> Result<bool, AppError> {
     let row: Option<(i32,)> =
         sqlx::query_as("SELECT 1 FROM sources WHERE id = $2::uuid AND tenant_id = $1")
@@ -548,6 +615,10 @@ pub async fn owns_source(pool: &PgPool, tenant: &str, id: &str) -> Result<bool, 
 /// re-encounters its own Pod (409 reattach) must give that Pod the token it is holding, not a
 /// fresh one. Returns `None` when the source is gone, and `(token, sha256-of-the-archive)` when it
 /// is not — the Pod verifies the archive it downloads against that hash.
+///
+/// # Errors
+///
+/// `AppError::Database` when the mint fails.
 pub async fn mint_source_token(
     pool: &PgPool,
     tenant: &str,
@@ -555,7 +626,7 @@ pub async fn mint_source_token(
     source_id: &str,
 ) -> Result<Option<(String, String)>, AppError> {
     let row: Option<(String, String)> = sqlx::query_as(
-        r#"
+        r"
         WITH fresh AS (
             SELECT replace(gen_random_uuid()::text, '-', '')
                 || replace(gen_random_uuid()::text, '-', '') AS raw
@@ -573,7 +644,7 @@ pub async fn mint_source_token(
         FROM live l
         WHERE s.id = $3::uuid AND s.tenant_id = $2
         RETURNING s.token, s.sha256
-        "#,
+        ",
     )
     .bind(job_id)
     .bind(tenant)
@@ -587,16 +658,21 @@ pub async fn mint_source_token(
 ///
 /// A wrong token and an unknown source answer identically on purpose: the id alone must not be
 /// an oracle for what exists.
+///
+/// # Errors
+///
+/// `AppError::BadRequest` for an id that is not a UUID, and `AppError::Database` when the
+/// query fails.
 pub async fn source_blob(
     pool: &PgPool,
     id: &str,
     token: &str,
 ) -> Result<Option<Vec<u8>>, AppError> {
     let row: Option<(Vec<u8>,)> = sqlx::query_as(
-        r#"
+        r"
         SELECT blob FROM sources
         WHERE id = $1::uuid AND token = $2 AND token_expires_at > now()
-        "#,
+        ",
     )
     .bind(id)
     .bind(token)
@@ -616,9 +692,13 @@ pub async fn source_blob(
 /// This is the only deletion path: deleting on a job's terminal state would race both the
 /// 409-reattach retry and a lost create response, so a blob lives until it is neither old nor
 /// wanted. The caller's period is what bounds the window in practice.
+///
+/// # Errors
+///
+/// `AppError::Database` when the delete fails.
 pub async fn reap_sources(pool: &PgPool, older_than_seconds: i64) -> Result<u64, AppError> {
     let outcome = sqlx::query(
-        r#"
+        r"
         DELETE FROM sources s
         WHERE s.created_at < now() - make_interval(secs => $1::int)
           AND NOT EXISTS (
@@ -637,7 +717,7 @@ pub async fn reap_sources(pool: &PgPool, older_than_seconds: i64) -> Result<u64,
                     )
                 )
           )
-        "#,
+        ",
     )
     .bind(older_than_seconds)
     .execute(pool)

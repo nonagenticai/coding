@@ -27,11 +27,22 @@ pub struct Config {
 }
 
 impl Config {
+    /// Read the served configuration from the process environment.
+    ///
+    /// # Errors
+    ///
+    /// `ConfigError::Missing` when `DATABASE_URL` or `BIND_ADDR` is unset or empty, and
+    /// `ConfigError::Invalid` when `BIND_ADDR` is not a `host:port` socket address.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
 
     /// Testable core of [`Config::from_env`]. Empty values count as unset.
+    ///
+    /// # Errors
+    ///
+    /// `ConfigError::Missing` when `DATABASE_URL` or `BIND_ADDR` is unset or empty, and
+    /// `ConfigError::Invalid` when `BIND_ADDR` is not a `host:port` socket address.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let get = |k: &str| get(k).filter(|v| !v.trim().is_empty());
         let database_url = get("DATABASE_URL").ok_or(ConfigError::Missing("DATABASE_URL"))?;
@@ -64,11 +75,20 @@ pub struct WorkerConfig {
 }
 
 impl WorkerConfig {
+    /// Read the worker configuration from the process environment.
+    ///
+    /// # Errors
+    ///
+    /// `ConfigError::Missing` when `DATABASE_URL` is unset or empty.
     pub fn from_env() -> Result<Self, ConfigError> {
         Self::from_lookup(|k| std::env::var(k).ok())
     }
 
     /// Testable core of [`WorkerConfig::from_env`]. Empty values count as unset.
+    ///
+    /// # Errors
+    ///
+    /// `ConfigError::Missing` when `DATABASE_URL` is unset or empty.
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Self, ConfigError> {
         let get = |k: &str| get(k).filter(|v| !v.trim().is_empty());
         let database_url = get("DATABASE_URL").ok_or(ConfigError::Missing("DATABASE_URL"))?;

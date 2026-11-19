@@ -734,17 +734,16 @@ async fn a_job_cannot_name_another_tenants_source() {
 }
 
 #[tokio::test]
+// reason: `state` is the app state and `stale` is an upload's age; both names are earned.
+#[allow(clippy::similar_names)]
 async fn the_source_reaper_deletes_only_unreferenced_old_uploads() {
-    let (state, pool) = state_with_db().await;
-    let tenant = unique_tenant("http-source-reap");
-
     async fn store(pool: &sqlx::PgPool, tenant: &str, age_hours: i64) -> String {
         let blob = sample_archive();
         let id = coding::store::create_source(
             pool,
             tenant,
             &coding::source_archive::sha256_hex(&blob),
-            blob.len() as i64,
+            i64::try_from(blob.len()).expect("the sample archive fits in i64"),
             2,
             &blob,
         )
@@ -758,6 +757,9 @@ async fn the_source_reaper_deletes_only_unreferenced_old_uploads() {
             .expect("age");
         id
     }
+
+    let (state, pool) = state_with_db().await;
+    let tenant = unique_tenant("http-source-reap");
 
     let stale = store(&pool, &tenant, 3).await;
     let referenced = store(&pool, &tenant, 3).await;

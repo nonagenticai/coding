@@ -1,7 +1,7 @@
 //! A throwaway Postgres for one job, started inside the Pod.
 //!
 //! The estate's test suites fail **closed** without `TEST_DATABASE_URL` — `coding`'s own
-//! `tests/db.rs` panics with "no TEST_DATABASE_URL/DATABASE_URL and `docker` cannot run". Inside
+//! `tests/db.rs` panics with "no `TEST_DATABASE_URL/DATABASE_URL` and `docker` cannot run". Inside
 //! a kata Pod there is no docker (deliberately) and no database, so any repository whose tests
 //! touch a database reported a failing `cargo test` for a reason that had nothing to do with its
 //! code. This module removes that excuse the same way `rbuild` does on the build host and the CI
@@ -30,6 +30,7 @@ const BIN_DIR: &str = "/usr/lib/postgresql/18/bin";
 /// the control-plane image and on a developer's Mac cannot, and those tests exercise the plans
 /// themselves. A host without the binaries runs the plan without a database, exactly as it did
 /// before this module existed, and says so.
+#[must_use]
 pub fn available() -> bool {
     std::path::Path::new(BIN_DIR).join("initdb").is_file()
 }
@@ -47,6 +48,7 @@ pub fn available() -> bool {
 ///
 /// `DATABASE_URL` is deliberately **not** consulted: in a deployment it names the service's own
 /// database, and a repository's tests must never be pointed at that.
+#[must_use]
 pub fn exported_url() -> Option<String> {
     std::env::var("TEST_DATABASE_URL")
         .ok()
@@ -75,6 +77,7 @@ impl ThrowawayPostgres {
     pub const DSN: &'static str = "postgres://postgres:postgres@127.0.0.1:5432/postgres";
 
     /// The DSN a test harness should use.
+    #[must_use]
     pub fn url(&self) -> String {
         Self::DSN.to_owned()
     }
@@ -89,6 +92,7 @@ impl ThrowawayPostgres {
     }
 
     /// The last lines of the cluster log, for an error message.
+    #[must_use]
     pub fn log_tail(&self) -> String {
         let text = std::fs::read_to_string(&self.log_path).unwrap_or_default();
         tail(&text, 2048).to_owned()
@@ -97,6 +101,7 @@ impl ThrowawayPostgres {
     /// The pid the postmaster recorded, when it recorded one. `postmaster.pid` carries it on the
     /// first line. Diagnostic only: whether a test can connect is decided by the socket, never by
     /// this number.
+    #[must_use]
     pub fn pid(&self) -> Option<u32> {
         let text = std::fs::read_to_string(self.data_dir.join("postmaster.pid")).ok()?;
         text.lines().next()?.trim().parse().ok()
@@ -104,6 +109,7 @@ impl ThrowawayPostgres {
 
     /// The postmaster's peak resident size in kB, from `/proc`. `None` where `/proc` is absent or
     /// the process is gone — the absence of a counter is not a zero.
+    #[must_use]
     pub fn rss_peak_kb(&self) -> Option<u64> {
         let pid = self.pid()?;
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
@@ -119,13 +125,13 @@ impl ThrowawayPostgres {
 /// This is what tells a killed postmaster apart from one that exited on its own: a non-zero
 /// `oom_kill` means the kernel took it. Read from the Pod's cgroup v2 root; a host without those
 /// files answers `unknown`, which is a hole in the evidence and is printed as one.
+#[must_use]
 pub fn cgroup_memory() -> String {
     let oom_kill = read_counter("/sys/fs/cgroup/memory.events", "oom_kill ")
         .unwrap_or_else(|| "unknown".to_owned());
     let peak = std::fs::read_to_string("/sys/fs/cgroup/memory.peak")
         .ok()
-        .map(|text| text.trim().to_owned())
-        .unwrap_or_else(|| "unknown".to_owned());
+        .map_or_else(|| "unknown".to_owned(), |text| text.trim().to_owned());
     format!("cgroup_oom_kill={oom_kill} cgroup_peak={peak}")
 }
 
@@ -164,6 +170,12 @@ impl Drop for ThrowawayPostgres {
 }
 
 /// Start a cluster under `scratch` and wait until it accepts connections.
+///
+/// # Errors
+///
+/// A `String` naming the failure when the data directory cannot be cleared or created,
+/// `initdb` fails or exceeds its 60s limit, `pg_ctl` refuses to start the cluster, or the
+/// socket never accepts a connection.
 pub async fn start(scratch: &Path) -> Result<ThrowawayPostgres, String> {
     let data_dir = scratch.join("pgdata");
     let log_path = scratch.join("postgres.log");

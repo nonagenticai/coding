@@ -30,6 +30,7 @@ pub enum HookKind {
 }
 
 impl HookKind {
+    #[must_use]
     pub fn file_name(self) -> &'static str {
         match self {
             Self::PrePush => "pre-push",
@@ -42,6 +43,12 @@ impl HookKind {
 ///
 /// A pre-commit hook runs `kind` (default `lint`) against the **index**. A pre-push hook ignores
 /// `kind` and runs `build` then `test` against **HEAD**, as two requests.
+///
+/// # Errors
+///
+/// A `String` naming the failure when `dir` is not inside a git repository, when a hook this
+/// tool did not install already exists and `force` is false, or when the hook file cannot be
+/// created, written or made executable.
 pub fn install(dir: &Path, hook: HookKind, kind: JobKind, force: bool) -> Result<PathBuf, String> {
     let path = hook_path(dir, hook)?;
     if path.exists() && !force {
@@ -64,6 +71,11 @@ pub fn install(dir: &Path, hook: HookKind, kind: JobKind, force: bool) -> Result
 }
 
 /// Remove a hook this tool installed. A foreign hook is never touched.
+///
+/// # Errors
+///
+/// A `String` naming the failure when `dir` is not inside a git repository, when the existing
+/// hook was not installed by this tool, or when it cannot be read or removed.
 pub fn uninstall(dir: &Path, hook: HookKind) -> Result<PathBuf, String> {
     let path = hook_path(dir, hook)?;
     if !path.exists() {
@@ -287,6 +299,7 @@ mod tests {
 
     #[cfg(unix)]
     fn stub_coding(name: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!(
             "coding-stub-{name}-{}-{:?}",
             std::process::id(),
@@ -308,7 +321,6 @@ esac
 "#,
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         (dir, log)
     }

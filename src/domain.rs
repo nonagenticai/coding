@@ -28,9 +28,9 @@ pub enum JobKind {
     GithubOp,
     /// Bulk dependency upgrade (replaces coding-repo-jobs).
     DependencyUpgrade,
-    /// PyPI package -> crate mapping for the rewrite capability.
+    /// `PyPI` package -> crate mapping for the rewrite capability.
     CrateMap,
-    /// Rewrite parity: OpenAPI contract diff.
+    /// Rewrite parity: `OpenAPI` contract diff.
     ParityOpenapi,
     /// Rewrite parity: database schema diff.
     ParitySchema,
@@ -42,6 +42,7 @@ pub enum JobKind {
 
 impl JobKind {
     /// Stable wire/DB spelling. Kept explicit so the DB and the API cannot drift.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Test => "test",
@@ -62,6 +63,7 @@ impl JobKind {
 
     /// Parse the DB/wire spelling. `None` means a row written by a newer build, not a request
     /// error, so the caller renders it as `503` rather than blaming the client.
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "test" => Self::Test,
@@ -100,6 +102,7 @@ pub enum Profile {
 
 impl Profile {
     /// Stable wire/DB spelling, for the same reason [`JobKind::as_str`] exists.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Rust => "rust",
@@ -107,6 +110,7 @@ impl Profile {
         }
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "rust" => Self::Rust,
@@ -116,12 +120,14 @@ impl Profile {
     }
 
     /// Whether this is the default. Serde uses it to omit the field entirely for Rust jobs.
+    #[must_use]
     pub fn is_rust(&self) -> bool {
         matches!(self, Self::Rust)
     }
 
     /// The file whose presence proves the tree is this profile's, checked by the runner against
     /// the materialised source. A mismatch is reported as `unsupported`, never as a failing check.
+    #[must_use]
     pub fn marker_file(self) -> &'static str {
         match self {
             Self::Rust => "Cargo.toml",
@@ -141,6 +147,7 @@ pub enum JobStatus {
 }
 
 impl JobStatus {
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
@@ -151,10 +158,12 @@ impl JobStatus {
         }
     }
 
+    #[must_use]
     pub fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 
+    #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Some(match value {
             "queued" => Self::Queued,
@@ -180,6 +189,7 @@ pub const MAX_SOURCES: usize = 8;
 pub const MAX_SOURCE_NAME_BYTES: usize = 32;
 
 /// Whether a source name is one the runner can materialise as `/tmp/sources/<name>`.
+#[must_use]
 pub fn valid_source_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     if bytes.is_empty() || bytes.len() > MAX_SOURCE_NAME_BYTES {
@@ -317,6 +327,11 @@ fn needs_source(kind: JobKind) -> bool {
 impl JobInput {
     /// Enforce the input contract for `kind`: a source is required for the kinds that run code,
     /// and every source that is present must be materialisable.
+    ///
+    /// # Errors
+    ///
+    /// `InputError` naming the first violated rule: a source missing for a code-running kind,
+    /// or a source field that is malformed, out of range or not allowed for its variant.
     pub fn validate(&self, kind: JobKind) -> Result<(), InputError> {
         self.validate_shape()?;
         if self.source.is_none() && self.sources.is_empty() && needs_source(kind) {
@@ -333,6 +348,7 @@ impl JobInput {
     /// The route checks each one belongs to the caller before a row exists: without that, a
     /// foreign or stale id is accepted here and only refused by the worker at claim time, after
     /// the caller has been told 202.
+    #[must_use]
     pub fn upload_source_ids(&self) -> Vec<&str> {
         let mut ids = Vec::new();
         if let Some(Source::Upload { id, .. }) = &self.source {
@@ -524,6 +540,10 @@ fn validate_source(source: &Source) -> Result<(), InputError> {
 
 /// A canonical UUID, as Postgres renders one. The id is cast in SQL, so a malformed one would
 /// otherwise surface as a database error rather than a 400 that names the field.
+///
+/// # Errors
+///
+/// `InputError` when `value` is not 36 characters or not a canonical hyphenated UUID.
 pub fn validate_uuid(value: &str, field: &str) -> Result<(), InputError> {
     let bytes = value.as_bytes();
     if bytes.len() != 36 {

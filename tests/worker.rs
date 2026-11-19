@@ -48,6 +48,10 @@ struct TestDb {
     schema: String,
 }
 
+// The clock is not fine-grained enough on every OS for two tests starting in parallel to get
+// distinct nanos, so add a process-local sequence as well.
+static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
+
 impl TestDb {
     async fn new() -> Self {
         let url = std::env::var("TEST_DATABASE_URL")
@@ -62,9 +66,6 @@ impl TestDb {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        // The clock is not fine-grained enough on every OS for two tests starting in parallel
-        // to get distinct nanos, so add a process-local sequence as well.
-        static SCHEMA_SEQ: AtomicU64 = AtomicU64::new(0);
         let seq = SCHEMA_SEQ.fetch_add(1, Ordering::Relaxed);
         let schema = format!("worker_{}_{nanos}_{seq}", std::process::id());
         sqlx::query(AssertSqlSafe(format!("CREATE SCHEMA \"{schema}\"")))
