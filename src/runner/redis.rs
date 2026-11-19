@@ -1,7 +1,7 @@
 //! A throwaway Redis for one job, started inside the Pod.
 //!
 //! The estate's harnesses fail **closed** without `TEST_REDIS_URL` / `REDIS_URL` — conveyor's bus
-//! tests panic with "no TEST_REDIS_URL/REDIS_URL and `docker` cannot run", and many services read
+//! tests panic with "no `TEST_REDIS_URL/REDIS_URL` and `docker` cannot run", and many services read
 //! the same pair. Inside a kata Pod there is no docker (deliberately) and no Redis, so any
 //! repository whose tests need one reported a failing check for a reason that had nothing to do
 //! with its code. This module removes that excuse the same way [`postgres`](super::postgres) does:
@@ -38,6 +38,7 @@ const STARTUP_BUDGET: Duration = Duration::from_secs(30);
 /// The shipped runner image always can — its build asserts `redis-server --version` — but the
 /// control-plane image and a developer's Mac may not, and those run the plan without one (the
 /// `exec` module says so instead of failing).
+#[must_use]
 pub fn available() -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -51,6 +52,7 @@ pub fn available() -> bool {
 /// `TEST_REDIS_URL` is the estate's harness convention; `REDIS_URL` is the CI spelling. A
 /// repository whose own tests call the runner would otherwise start a second server on port 6379
 /// and its drop would stop the job's.
+#[must_use]
 pub fn exported_url() -> Option<String> {
     ["TEST_REDIS_URL", "REDIS_URL"].iter().find_map(|key| {
         std::env::var(key)
@@ -62,6 +64,7 @@ pub fn exported_url() -> Option<String> {
 
 /// A private Redis the environment already provides (`TEST_REDIS_PRIVATE_URL`). The runner exports
 /// it from its second server; a caller-provided one wins and nothing is started beside it.
+#[must_use]
 pub fn exported_private_url() -> Option<String> {
     std::env::var("TEST_REDIS_PRIVATE_URL")
         .ok()
@@ -73,6 +76,7 @@ pub fn exported_private_url() -> Option<String> {
 ///
 /// The CI hands the runner a dind Redis on a random host port (`redis://127.0.0.1:32768`), so a
 /// liveness probe that always dials [`PORT`] asks about a different server than the step used.
+#[must_use]
 pub fn port_of(url: &str) -> Option<u16> {
     let rest = url.strip_prefix("redis://").unwrap_or(url);
     let authority = rest.split('/').next()?;
@@ -136,6 +140,11 @@ impl Drop for ThrowawayRedis {
 }
 
 /// Start a Redis on `port` under `scratch` and wait until it accepts connections.
+///
+/// # Errors
+///
+/// A `String` naming the failure when the work directory cannot be cleared or created,
+/// `redis-server` fails to start, or the port never accepts a connection before the deadline.
 pub async fn start(scratch: &Path, port: u16) -> Result<ThrowawayRedis, String> {
     let dir = scratch.join(format!("redis-{port}"));
     if dir.exists() {

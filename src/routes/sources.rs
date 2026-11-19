@@ -89,14 +89,11 @@ pub async fn create_source(
     };
 
     let limit = source_archive::MAX_COMPRESSED_BYTES;
-    let body = match axum::body::to_bytes(request.into_body(), limit + 1).await {
-        Ok(body) => body,
-        Err(_) => {
-            return AppError::PayloadTooLarge(format!(
-                "the archive could not be read in full, or is over the {limit}-byte cap"
-            ))
-            .into_response();
-        }
+    let Ok(body) = axum::body::to_bytes(request.into_body(), limit + 1).await else {
+        return AppError::PayloadTooLarge(format!(
+            "the archive could not be read in full, or is over the {limit}-byte cap"
+        ))
+        .into_response();
     };
     if body.len() > limit {
         return AppError::PayloadTooLarge(format!(
@@ -111,23 +108,19 @@ pub async fn create_source(
         Err(error) => return AppError::BadRequest(error.to_string()).into_response(),
     };
     let sha256 = source_archive::sha256_hex(&body);
-    let files = match i32::try_from(manifest.files) {
-        Ok(files) => files,
-        Err(_) => {
-            return AppError::BadRequest("the archive carries too many files".to_owned())
-                .into_response();
-        }
+    let Ok(files) = i32::try_from(manifest.files) else {
+        return AppError::BadRequest("the archive carries too many files".to_owned())
+            .into_response();
     };
 
-    let created = store::create_source(
-        &state.pool,
-        tenant.as_str(),
-        &sha256,
-        body.len() as i64,
-        files,
-        &body,
-    )
-    .await;
+    // The body was capped by `limit + 1` bytes above, far inside `i64`; a length that still
+    // overflowed is answered as too large rather than panicking.
+    let Ok(bytes) = i64::try_from(body.len()) else {
+        return AppError::PayloadTooLarge("the archive is too large to record".to_owned())
+            .into_response();
+    };
+    let created =
+        store::create_source(&state.pool, tenant.as_str(), &sha256, bytes, files, &body).await;
     drop(permit);
 
     match created {
@@ -136,7 +129,7 @@ pub async fn create_source(
             Json(SourceCreated {
                 id,
                 sha256,
-                bytes: body.len() as i64,
+                bytes,
                 files: manifest.files,
             }),
         )

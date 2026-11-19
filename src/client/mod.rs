@@ -115,6 +115,8 @@ pub async fn check(args: CheckArgs) -> u8 {
     }
 }
 
+// reason: one linear upload -> poll -> verdict flow reads better kept together.
+#[allow(clippy::too_many_lines)]
 async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     // The URL is resolved only after the dry-run exit below: what a dry run shows is the tree it
     // would send, and that is true with no app reachable at all.
@@ -292,7 +294,7 @@ fn resolve_url(flag: Option<&str>, env: Option<String>) -> Result<String, Client
     Ok(raw.trim_end_matches('/').to_owned())
 }
 
-/// The licence bearer, if one was supplied. `--token`/CODING_TOKEN wins over `git config
+/// The licence bearer, if one was supplied. `--token`/`CODING_TOKEN` wins over `git config
 /// coding.token`; a blank value is treated as absent so an empty config cannot send `Bearer `.
 fn resolve_token(flag: Option<String>, git_config_value: Option<String>) -> Option<String> {
     [flag, git_config_value]
@@ -374,8 +376,7 @@ async fn read_json(response: reqwest::Response) -> Result<Value, ClientError> {
         .get("error")
         .and_then(|error| error.get("message"))
         .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| body.trim().chars().take(400).collect());
+        .map_or_else(|| body.trim().chars().take(400).collect(), str::to_owned);
     let message = format!("the app refused the request ({status}): {message}");
     // 4xx is something the caller can fix (the tree, the tenant); 429 and 5xx are not.
     if status.is_client_error() && status != reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -423,7 +424,7 @@ async fn poll_to_verdict(
                 let status = created_status(&job);
                 if status != last {
                     println!("  [{:>5.1}s] {status}", started.elapsed().as_secs_f32());
-                    last = status.clone();
+                    last.clone_from(&status);
                 }
                 if matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
                     return Ok(job);
@@ -519,13 +520,16 @@ fn print_verdict(job: &Value) {
             let exit = check
                 .get("exit_code")
                 .and_then(Value::as_i64)
-                .map(|code| format!(" (exit {code})"))
-                .unwrap_or_default();
+                .map_or_default(|code| format!(" (exit {code})"));
             let duration = check
                 .get("duration_ms")
                 .and_then(Value::as_u64)
-                .map(|ms| format!("  {:.1}s", ms as f64 / 1000.0))
-                .unwrap_or_default();
+                .map_or_default(|ms| {
+                    format!(
+                        "  {:.1}s",
+                        std::time::Duration::from_millis(ms).as_secs_f64()
+                    )
+                });
             let marker = if status == "passed" { "PASS" } else { "FAIL" };
             println!("  {marker}  {name}{exit}{duration}");
         }
@@ -533,8 +537,7 @@ fn print_verdict(job: &Value) {
     for check in result
         .get("checks")
         .and_then(Value::as_array)
-        .map(Vec::as_slice)
-        .unwrap_or_default()
+        .map_or_default(Vec::as_slice)
     {
         if check.get("status").and_then(Value::as_str) != Some("failed") {
             continue;
@@ -674,7 +677,7 @@ mod tests {
         ));
     }
 
-    fn job(result: Option<Value>, error: Option<Value>) -> Value {
+    fn job(result: Option<&Value>, error: Option<&Value>) -> Value {
         json!({
             "id": "j",
             "kind": "check",
@@ -693,36 +696,36 @@ mod tests {
         // A runner that died setting the job up: `failed`, an error, and no check ever ran.
         let setup_failure =
             json!({"status": "failed", "error": "the downloaded source hashes to …"});
-        assert_eq!(verdict_code(&job(Some(passed), None)), EXIT_OK);
-        assert_eq!(verdict_code(&job(Some(failed), None)), EXIT_FAILED);
+        assert_eq!(verdict_code(&job(Some(&passed), None)), EXIT_OK);
+        assert_eq!(verdict_code(&job(Some(&failed), None)), EXIT_FAILED);
         assert_eq!(
-            verdict_code(&job(Some(setup_failure), None)),
+            verdict_code(&job(Some(&setup_failure), None)),
             EXIT_INFRA,
             "an infrastructure failure must not block a hook as if the code were bad"
         );
         assert_eq!(
-            verdict_code(&job(Some(json!({"status": "unsupported"})), None)),
+            verdict_code(&job(Some(&json!({"status": "unsupported"})), None)),
             EXIT_USAGE
         );
         assert_eq!(
-            verdict_code(&job(Some(json!({"status": "invalid_spec"})), None)),
+            verdict_code(&job(Some(&json!({"status": "invalid_spec"})), None)),
             EXIT_USAGE
         );
         assert_eq!(
-            verdict_code(&job(Some(json!({"status": "cancelled"})), None)),
+            verdict_code(&job(Some(&json!({"status": "cancelled"})), None)),
             EXIT_INFRA
         );
         assert_eq!(
             verdict_code(&job(
                 None,
-                Some(json!({"code": "runner_failed", "retryable": false}))
+                Some(&json!({"code": "runner_failed", "retryable": false}))
             )),
             EXIT_INFRA
         );
         assert_eq!(
             verdict_code(&job(
                 None,
-                Some(json!({"code": "sandbox_not_configured", "retryable": false}))
+                Some(&json!({"code": "sandbox_not_configured", "retryable": false}))
             )),
             EXIT_USAGE
         );

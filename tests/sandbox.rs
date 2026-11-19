@@ -546,6 +546,8 @@ fn oversized_spec_is_refused() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
+// reason: `deleted` is the reap count and `deletes` is the stub's request log; both are earned.
+#[allow(clippy::similar_names)]
 async fn reap_uses_the_pods_own_deadline_not_the_fixed_age() {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -580,7 +582,7 @@ async fn reap_uses_the_pods_own_deadline_not_the_fixed_age() {
     });
     let sandbox = sandbox_for(&stub).await;
 
-    let deleted = sandbox.reap(Duration::from_secs(900)).await.expect("reap");
+    let deleted = sandbox.reap(Duration::from_mins(15)).await.expect("reap");
     assert_eq!(
         deleted, 2,
         "only the expired and the un-annotated aged Pod go"
@@ -811,19 +813,9 @@ async fn failed_reports_the_reason_and_the_log_tail() {
 /// token and hash before the Pod exists. Without a test here the loop could silently skip the
 /// upload branch and every job would fail later, after a 202 — fail-open in the wrong direction.
 #[tokio::test]
+// reason: one linear arrange/act/assert narrative for the multi-source upload path.
+#[allow(clippy::too_many_lines)]
 async fn every_named_upload_source_is_prepared_with_its_own_capability() {
-    let url = std::env::var("TEST_DATABASE_URL")
-        .expect("TEST_DATABASE_URL must point at a real Postgres 18: this test never skips");
-    let pool = coding::db::connect(&url)
-        .await
-        .expect("connect TEST_DATABASE_URL");
-    coding::db::migrate(&pool).await.expect("migrate");
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let tenant = format!("sandbox-sources-{}-{nanos}", std::process::id());
-
     async fn store(pool: &sqlx::PgPool, tenant: &str, marker: &str) -> String {
         let blob = coding::source_archive::pack(&[
             coding::source_archive::PackFile {
@@ -843,13 +835,26 @@ async fn every_named_upload_source_is_prepared_with_its_own_capability() {
             pool,
             tenant,
             &coding::source_archive::sha256_hex(&blob),
-            blob.len() as i64,
+            i64::try_from(blob.len()).expect("the sample archive fits in i64"),
             2,
             &blob,
         )
         .await
         .expect("store")
     }
+
+    let url = std::env::var("TEST_DATABASE_URL")
+        .expect("TEST_DATABASE_URL must point at a real Postgres 18: this test never skips");
+    let pool = coding::db::connect(&url)
+        .await
+        .expect("connect TEST_DATABASE_URL");
+    coding::db::migrate(&pool).await.expect("migrate");
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let tenant = format!("sandbox-sources-{}-{nanos}", std::process::id());
+
     let first = store(&pool, &tenant, "pub fn one() {}").await;
     let second = store(&pool, &tenant, "pub fn two() {}").await;
 

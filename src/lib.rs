@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Service library: router, OpenAPI document, configuration, database and the reusable
+//! Service library: router, `OpenAPI` document, configuration, database and the reusable
 //! trusted-header tenant extractor. `main.rs` is a thin wrapper so integration tests can
 //! build the exact router the binary serves.
 
@@ -36,7 +36,7 @@ pub struct AppState {
     pub default_tenant: Option<String>,
 }
 
-/// Document-level OpenAPI metadata. `info` (title, version, description) comes from
+/// Document-level `OpenAPI` metadata. `info` (title, version, description) comes from
 /// Cargo.toml, so renaming the crate renames the spec.
 #[derive(OpenApi)]
 #[openapi(
@@ -49,7 +49,7 @@ pub struct AppState {
 struct ApiDoc;
 
 /// Every route is registered here, through `routes!`, so the served router and the
-/// OpenAPI document cannot drift: a handler without `#[utoipa::path]` does not compile here.
+/// `OpenAPI` document cannot drift: a handler without `#[utoipa::path]` does not compile here.
 fn api_router() -> OpenApiRouter<AppState> {
     OpenApiRouter::with_openapi(ApiDoc::openapi())
         .routes(routes!(routes::health::health))
@@ -64,7 +64,8 @@ fn api_router() -> OpenApiRouter<AppState> {
         .routes(routes!(routes::sources::source_blob))
 }
 
-/// The OpenAPI document of this service (what `--print-openapi` writes). Needs no env and no DB.
+/// The `OpenAPI` document of this service (what `--print-openapi` writes). Needs no env and no DB.
+#[must_use]
 pub fn openapi() -> utoipa::openapi::OpenApi {
     let (_, spec) = api_router().split_for_parts();
     spec

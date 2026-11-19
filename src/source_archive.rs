@@ -78,6 +78,12 @@ pub struct PackFile {
 ///
 /// Reproducible on purpose: paths are sorted, and mtime, uid, gid and every mode other than the
 /// executable bit are normalised, so the sha256 of the bytes identifies the tree and nothing else.
+///
+/// # Errors
+///
+/// `ArchiveError::Invalid` when a path is not a safe relative path, `ArchiveError::Io` when the
+/// tar or gzip stream cannot be written, and `ArchiveError::TooLarge` when the compressed blob
+/// exceeds the cap.
 pub fn pack(files: &[PackFile]) -> Result<Vec<u8>, ArchiveError> {
     let mut sorted: Vec<&PackFile> = files.iter().collect();
     sorted.sort_by(|a, b| a.path.cmp(&b.path));
@@ -112,6 +118,12 @@ pub fn pack(files: &[PackFile]) -> Result<Vec<u8>, ArchiveError> {
 }
 
 /// Check an archive without unpacking it. Used by the API before it stores anything.
+///
+/// # Errors
+///
+/// `ArchiveError::TooLarge` when the blob exceeds the compressed cap, `ArchiveError::Invalid`
+/// when an entry breaks a path, link or size rule, and `ArchiveError::Io` when the gzip or tar
+/// stream cannot be read.
 pub fn validate(blob: &[u8]) -> Result<Manifest, ArchiveError> {
     if blob.len() > MAX_COMPRESSED_BYTES {
         return Err(ArchiveError::TooLarge { size: blob.len() });
@@ -128,6 +140,12 @@ pub fn validate(blob: &[u8]) -> Result<Manifest, ArchiveError> {
 }
 
 /// Validate an archive and unpack it under `dir`.
+///
+/// # Errors
+///
+/// `ArchiveError::TooLarge` when the blob exceeds the compressed cap, `ArchiveError::Invalid`
+/// when an entry breaks a path, link or size rule, and `ArchiveError::Io` when `dir` cannot be
+/// created or an entry cannot be written.
 pub fn unpack(blob: &[u8], dir: &Path) -> Result<Manifest, ArchiveError> {
     if blob.len() > MAX_COMPRESSED_BYTES {
         return Err(ArchiveError::TooLarge { size: blob.len() });
@@ -170,6 +188,7 @@ pub fn unpack(blob: &[u8], dir: &Path) -> Result<Manifest, ArchiveError> {
 
 /// The sha256 of the archive bytes, as lowercase hex. This is what a Pod verifies before it
 /// unpacks, and what the API reports to the client.
+#[must_use]
 pub fn sha256_hex(blob: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     use std::fmt::Write as _;
@@ -182,6 +201,11 @@ pub fn sha256_hex(blob: &[u8]) -> String {
 }
 
 /// A path proven to stay under `dir`: relative, no `..`, no absolute component.
+///
+/// # Errors
+///
+/// `ArchiveError::Invalid` when `path` is empty, absolute, contains a backslash or NUL, or has
+/// a `.`, `..` or empty component.
 pub fn safe_target(dir: &Path, path: &str) -> Result<PathBuf, ArchiveError> {
     validate_inner_path(path)?;
     Ok(dir.join(path))
@@ -330,7 +354,11 @@ impl<R> CappedReader<R> {
 
 impl<R: Read> Read for CappedReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let want = buf.len().min(self.remaining as usize + 1);
+        // The cap is orders of magnitude below `usize::MAX`; the checked conversion makes a
+        // 32-bit target fail loudly instead of truncating.
+        let want = buf
+            .len()
+            .min(usize::try_from(self.remaining).expect("the byte cap fits in usize") + 1);
         let read = self.inner.read(&mut buf[..want])?;
         if read as u64 > self.remaining {
             return Err(std::io::Error::other(format!(
@@ -487,7 +515,8 @@ mod tests {
         // Five entries that each claim — and carry — a quarter of the total cap plus a little:
         // every single one is inside the per-file cap, and together they run past what the
         // decompressor may emit. The archive itself is tiny once compressed: that is the bomb.
-        let chunk = vec![0u8; (MAX_UNCOMPRESSED_BYTES / 5 + 1024) as usize];
+        let chunk =
+            vec![0u8; usize::try_from(MAX_UNCOMPRESSED_BYTES / 5 + 1024).expect("fits in usize")];
         let mut builder = tar::Builder::new(Vec::new());
         for index in 0..5 {
             let mut header = tar::Header::new_gnu();

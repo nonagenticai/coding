@@ -48,6 +48,10 @@ pub struct Cancellation {
 
 impl Cancellation {
     /// Subscribe to SIGTERM. A failure here is fatal for the process, not for a job.
+    ///
+    /// # Errors
+    ///
+    /// The `std::io::Error` from registering the SIGTERM handler.
     pub fn new() -> std::io::Result<Self> {
         Ok(Self {
             signal: signal(SignalKind::terminate())?,
@@ -139,7 +143,15 @@ fn attach_sources(result: &mut RunnerResult, multi: bool, infos: &mut [Option<So
     }
 }
 
+/// Wall-clock milliseconds since `started`, as the result's `duration_ms` type. A step short of
+/// 584 million years fits in `u64`, so the conversion cannot fail.
+fn elapsed_millis(started: TokioInstant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).expect("elapsed ms fit in u64")
+}
+
 /// [`run`] against an explicit work base. Tests use this; the Pod uses [`WORK_DIR`].
+// reason: the measured step sequence (clone -> services -> run -> classify) reads as one flow.
+#[allow(clippy::too_many_lines)]
 pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Path) -> RunnerResult {
     let units = units(spec, work_dir);
     // Every unit must have a plan before anything is cloned or started: a job that would check
@@ -370,7 +382,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                     let can_private = redis.can_start_private();
                     match redis.ensure_private().await {
                         Ok(url) => {
-                            println!("== redis: `{}` gets TEST_REDIS_PRIVATE_URL={url}", label);
+                            println!("== redis: `{label}` gets TEST_REDIS_PRIVATE_URL={url}");
                             private_redis_url = Some(url);
                         }
                         // The private server exists for one test shape (a FLUSHALL that must not touch
@@ -442,7 +454,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                     cancel,
                 )
                 .await;
-                duration_ms += started.elapsed().as_millis() as u64;
+                duration_ms += elapsed_millis(started);
                 let outcome = match outcome {
                     Ok(outcome) => outcome,
                     Err(err) => {
@@ -610,7 +622,10 @@ fn finish(mut result: RunnerResult) -> RunnerResult {
         .iter()
         .filter(|check| check.status == CheckStatus::Failed)
         .collect();
-    if !failing.is_empty() {
+    if failing.is_empty() {
+        result.status = Status::Succeeded;
+        result.summary = format!("{total} of {total} checks passed");
+    } else {
         result.status = Status::Failed;
         // Name the failing sources: with several plans in one Pod, "3 of 9 checks failed" does
         // not tell a caller which tree to look at.
@@ -629,9 +644,6 @@ fn finish(mut result: RunnerResult) -> RunnerResult {
                 names.join(", ")
             )
         };
-    } else {
-        result.status = Status::Succeeded;
-        result.summary = format!("{total} of {total} checks passed");
     }
     result
 }
@@ -736,8 +748,7 @@ impl Database {
         let tail = self
             .handle
             .as_ref()
-            .map(postgres::ThrowawayPostgres::log_tail)
-            .unwrap_or_default();
+            .map_or_default(postgres::ThrowawayPostgres::log_tail);
         format!(
             "the throwaway Postgres died during `{step}`; the check did not run against a \
              database. {}\n--- postgres log (tail) ---\n{}",
@@ -885,13 +896,11 @@ impl Redis {
         let main = self
             .handle
             .as_ref()
-            .map(redis::ThrowawayRedis::log_tail)
-            .unwrap_or_default();
+            .map_or_default(redis::ThrowawayRedis::log_tail);
         let private = self
             .private
             .as_ref()
-            .map(redis::ThrowawayRedis::log_tail)
-            .unwrap_or_default();
+            .map_or_default(redis::ThrowawayRedis::log_tail);
         format!(
             "the throwaway Redis died during `{step}`; the check did not run against a server. \
              {}\n--- redis log (tail) ---\n{}\n--- private redis log (tail) ---\n{}",
@@ -904,18 +913,14 @@ impl Redis {
     /// A bounded block for the Pod log: how the servers lived and how they ended.
     fn diagnostics(&self) -> Option<String> {
         let handle = self.handle.as_ref()?;
-        let private = self
-            .private
-            .as_ref()
-            .map(|private| {
-                format!(
-                    "== private redis: pid={:?} rss_peak_kb={:?}\n== private redis log (tail):\n{}",
-                    private.pid(),
-                    private.rss_peak_kb(),
-                    private.log_tail().trim()
-                )
-            })
-            .unwrap_or_default();
+        let private = self.private.as_ref().map_or_default(|private| {
+            format!(
+                "== private redis: pid={:?} rss_peak_kb={:?}\n== private redis log (tail):\n{}",
+                private.pid(),
+                private.rss_peak_kb(),
+                private.log_tail().trim()
+            )
+        });
         Some(format!(
             "== redis: pid={:?} rss_peak_kb={:?}\n== redis log (tail):\n{}\n{private}",
             handle.pid(),
@@ -944,7 +949,7 @@ impl Failure {
             Some(name) => format!("source {name:?}: {}", self.message),
             None => self.message,
         };
-        result.summary = message.clone();
+        result.summary.clone_from(&message);
         result.error = Some(message);
         result
     }
@@ -1103,8 +1108,8 @@ async fn download(
                     wait.as_millis()
                 );
                 tokio::select! {
-                    _ = tokio::time::sleep(wait) => {}
-                    _ = tokio::time::sleep_until(deadline) => {
+                    () = tokio::time::sleep(wait) => {}
+                    () = tokio::time::sleep_until(deadline) => {
                         return Err(Failure { stop: Stop::TimedOut, message: "the deadline was reached while waiting to retry the source fetch".to_owned() });
                     }
                     _ = cancel.signal.recv() => {
@@ -1142,7 +1147,7 @@ async fn fetch_once(
 
     let response = tokio::select! {
         response = client.get(url).header("x-source-token", token).send() => response,
-        _ = tokio::time::sleep_until(deadline) => {
+        () = tokio::time::sleep_until(deadline) => {
             return Err(FetchError { failure: Failure { stop: Stop::TimedOut, message: "the deadline was reached while fetching the uploaded source".to_owned() }, retryable: false });
         }
         _ = cancel.signal.recv() => {
@@ -1174,7 +1179,7 @@ async fn fetch_once(
             chunk = response.chunk() => {
                 chunk.map_err(|err| setup(format!("the source download failed mid-body: {err}")))?
             }
-            _ = tokio::time::sleep_until(deadline) => {
+            () = tokio::time::sleep_until(deadline) => {
                 return Err(FetchError { failure: Failure { stop: Stop::TimedOut, message: "the deadline was reached while reading the uploaded source".to_owned() }, retryable: false });
             }
             _ = cancel.signal.recv() => {
@@ -1281,7 +1286,7 @@ fn target_dir_for(source_dir: &Path) -> PathBuf {
 }
 
 /// The SQLAlchemy/psycopg v3 spelling of a PostgreSQL URL, derived from the same URL the step is
-/// told to use. `postgres://` and `postgresql://` are the same DSN; SQLAlchemy needs the driver
+/// told to use. `postgres://` and `postgresql://` are the same DSN; `SQLAlchemy` needs the driver
 /// named, and the estate's driver is psycopg v3 (`postgresql+psycopg://`).
 fn sqlalchemy_dsn(url: &str) -> String {
     if let Some(rest) = url
@@ -1402,7 +1407,7 @@ async fn run_child(
                 .map(|stderr| tokio::spawn(pump(stderr, tokio::io::stderr(), buffer.clone())));
             let stop = tokio::select! {
                 status = child.wait() => Stop::Exited(status?.code()),
-                _ = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(deadline) => {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     Stop::TimedOut
@@ -1433,7 +1438,7 @@ async fn run_child(
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             let output = tokio::select! {
                 output = command.output() => output?,
-                _ = tokio::time::sleep_until(deadline) => {
+                () = tokio::time::sleep_until(deadline) => {
                     return Ok(Outcome {
                         stop: Stop::TimedOut,
                         stdout: String::new(),
@@ -1506,18 +1511,18 @@ where
     let mut chunk = vec![0u8; 8192];
     loop {
         match reader.read(&mut chunk).await {
-            Ok(0) => break,
+            Ok(0) | Err(_) => break,
             Ok(read) => {
                 let _ = sink.write_all(&chunk[..read]).await;
                 let _ = sink.flush().await;
                 buffer.push(&chunk[..read]);
             }
-            Err(_) => break,
         }
     }
 }
 
 /// The default work directory, so callers can print it.
+#[must_use]
 pub fn default_source_dir() -> PathBuf {
     PathBuf::from(SOURCE_DIR)
 }

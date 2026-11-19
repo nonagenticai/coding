@@ -6,7 +6,7 @@
 //! several lanes share; conveyor made the same call (`apps/server/src/sandbox.rs`), and this is
 //! a deliberate port of it — with the sharp edges removed:
 //!
-//! - a **Pod**, not a `batch/v1` Job, created directly by the worker. No ConfigMap: the job
+//! - a **Pod**, not a `batch/v1` Job, created directly by the worker. No `ConfigMap`: the job
 //!   spec rides in a bounded `CODING_JOB_SPEC` env var, so a run that dies leaves one Pod that
 //!   the reaper can still find and delete.
 //! - the image is **digest-pinned and configured once**, never carried by a request payload.
@@ -41,23 +41,23 @@ pub const MULTI_SOURCE_ENV: &str = "CODING_RUNNER_MULTI_SOURCE";
 /// is refused before a Pod is created, so a deployment that has not been told about a profile
 /// fails with a message instead of an `invalid job spec` from an older runner.
 pub const PROFILES_ENV: &str = "CODING_RUNNER_PROFILES";
-/// `CODING_KATA_RUNTIME_CLASS`: the RuntimeClass that puts the Pod on the kata runtime.
+/// `CODING_KATA_RUNTIME_CLASS`: the `RuntimeClass` that puts the Pod on the kata runtime.
 pub const RUNTIME_CLASS_ENV: &str = "CODING_KATA_RUNTIME_CLASS";
 /// `CODING_RUNS_PULL_SECRET`: the imagePullSecret in the runs namespace. The runner image is
-/// private, and a Pod created with the default ServiceAccount has no pull credential — without
-/// this the run dies in ImagePullBackOff. Empty omits the field (public image).
+/// private, and a Pod created with the default `ServiceAccount` has no pull credential — without
+/// this the run dies in `ImagePullBackOff`. Empty omits the field (public image).
 pub const PULL_SECRET_ENV: &str = "CODING_RUNS_PULL_SECRET";
 /// The estate's standard pull-secret name, present in every service namespace.
 pub const DEFAULT_PULL_SECRET: &str = "registry-pull-secret";
 
-/// `CODING_SCCACHE_BUCKET` (optional): the MinIO bucket for the compilation cache. Unset or empty
+/// `CODING_SCCACHE_BUCKET` (optional): the `MinIO` bucket for the compilation cache. Unset or empty
 /// disables the cache entirely, and a job then runs exactly as it did before caching existed.
 pub const SCCACHE_BUCKET_ENV: &str = "CODING_SCCACHE_BUCKET";
 /// `CODING_SCCACHE_ENDPOINT`: the S3 endpoint sccache talks to. **Required whenever the bucket is
 /// set** — this is a public repository, so no private infrastructure address is baked in here; the
 /// deployment supplies it.
 pub const SCCACHE_ENDPOINT_ENV: &str = "CODING_SCCACHE_ENDPOINT";
-/// `CODING_SCCACHE_REGION`: MinIO ignores a region; the AWS SDK does not accept a request without
+/// `CODING_SCCACHE_REGION`: `MinIO` ignores a region; the AWS SDK does not accept a request without
 /// one.
 pub const SCCACHE_REGION_ENV: &str = "CODING_SCCACHE_REGION";
 /// `CODING_SCCACHE_USE_SSL`: `true` when the endpoint is https.
@@ -75,7 +75,7 @@ pub const SCCACHE_SECRET_UPLOADS_RW_ENV: &str = "CODING_SCCACHE_SECRET_UPLOADS_R
 /// namespace, with the write credential. Empty is the safe default: every job uses `uploads/`.
 pub const SCCACHE_WRITE_REPOS_ENV: &str = "CODING_SCCACHE_WRITE_REPOS";
 
-/// MinIO ignores the region, but the S3 client requires a syntactically valid one.
+/// `MinIO` ignores the region, but the S3 client requires a syntactically valid one.
 pub const DEFAULT_SCCACHE_REGION: &str = "us-east-1";
 pub const DEFAULT_SCCACHE_SECRET_GIT_RW: &str = "coding-sccache-git-rw";
 pub const DEFAULT_SCCACHE_SECRET_UPLOADS_RW: &str = "coding-sccache-uploads-rw";
@@ -87,7 +87,7 @@ pub const TOKEN_ENV: &str = "SANDBOX_TOKEN";
 /// `SANDBOX_CA_PATH`: overrides the mounted cluster CA.
 pub const CA_PATH_ENV: &str = "SANDBOX_CA_PATH";
 
-/// The default RuntimeClass that selects the kata runtime on the runner node.
+/// The default `RuntimeClass` that selects the kata runtime on the runner node.
 pub const DEFAULT_RUNTIME_CLASS: &str = "coding-kata";
 /// Unix seconds when the Pod was created: the clock for the fallback age policy.
 pub const CREATED_AT_ANNOTATION: &str = "coding.io/created-at";
@@ -170,7 +170,7 @@ pub enum SandboxError {
 /// The compilation-cache settings carried into every runner Pod.
 ///
 /// Two namespaces, two write identities: a trusted git build uses `<prefix>git/` with a credential
-/// the MinIO policy confines to that subtree, and everything else — uploaded working trees and
+/// the `MinIO` policy confines to that subtree, and everything else — uploaded working trees and
 /// inline files — uses `<prefix>uploads/` with its own confined credential. Neither builder can
 /// write the other's subtree, and neither reads the other's objects.
 ///
@@ -219,7 +219,7 @@ pub struct SandboxConfig {
     /// `CODING_RUNNER_MULTI_SOURCE` says otherwise, so a job created before the image was
     /// rolled is refused with a legible message instead of `invalid job spec` from the Pod.
     pub multi_source: bool,
-    /// The RuntimeClass that selects the kata runtime.
+    /// The `RuntimeClass` that selects the kata runtime.
     pub runtime_class: String,
     /// The API server base URL, e.g. `https://10.43.0.1:443`.
     pub api_url: String,
@@ -235,6 +235,12 @@ pub struct SandboxConfig {
 
 impl SandboxConfig {
     /// Read the sandbox configuration from the process environment.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::Missing` for an unset required variable, `SandboxError::Invalid` for a
+    /// value that cannot be used, and `SandboxError::Credential` when the service-account token
+    /// or CA PEM cannot be read.
     pub fn from_env() -> Result<Self, SandboxError> {
         Self::from_lookup(
             |key| std::env::var(key).ok(),
@@ -248,6 +254,14 @@ impl SandboxConfig {
     /// digest-pinned. The API address, token and CA default to the mounted service account and
     /// are overridable for tests. A CA that cannot be read fails **closed** for an `https://`
     /// endpoint: the client is never allowed to fall back to public roots.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::Missing` for an unset required variable, `SandboxError::Invalid` for a
+    /// value that cannot be used, and `SandboxError::Credential` when the service-account token
+    /// or CA PEM cannot be read.
+    // reason: one linear list of fail-closed checks; splitting it would hide a required env.
+    #[allow(clippy::too_many_lines)]
     pub fn from_lookup(
         get: impl Fn(&str) -> Option<String>,
         read_file: impl Fn(&str) -> Option<Vec<u8>>,
@@ -272,15 +286,14 @@ impl SandboxConfig {
         let profiles = profiles_from(get(PROFILES_ENV).as_deref())?;
         let multi_source = multi_source_from(get(MULTI_SOURCE_ENV).as_deref());
 
-        let api_url = match get(API_URL_ENV) {
-            Some(url) => url,
-            None => {
-                let host = get("KUBERNETES_SERVICE_HOST").ok_or(SandboxError::Missing(
-                    "KUBERNETES_SERVICE_HOST (or SANDBOX_API_URL)",
-                ))?;
-                let port = get("KUBERNETES_SERVICE_PORT").unwrap_or_else(|| "443".to_owned());
-                format!("https://{host}:{port}")
-            }
+        let api_url = if let Some(url) = get(API_URL_ENV) {
+            url
+        } else {
+            let host = get("KUBERNETES_SERVICE_HOST").ok_or(SandboxError::Missing(
+                "KUBERNETES_SERVICE_HOST (or SANDBOX_API_URL)",
+            ))?;
+            let port = get("KUBERNETES_SERVICE_PORT").unwrap_or_else(|| "443".to_owned());
+            format!("https://{host}:{port}")
         };
         if !(api_url.starts_with("https://") || api_url.starts_with("http://")) {
             return Err(SandboxError::Invalid {
@@ -396,7 +409,7 @@ impl SandboxConfig {
 }
 
 /// Parse `CODING_RUNNER_PROFILES`. Unset or empty is `rust`, the image's historical content; an
-/// unknown name fails closed at startup, so a typo in the deployment is a CrashLoop rather than
+/// unknown name fails closed at startup, so a typo in the deployment is a `CrashLoop` rather than
 /// a worker that silently refuses a profile it was meant to run.
 fn profiles_from(value: Option<&str>) -> Result<Vec<Profile>, SandboxError> {
     let Some(value) = value else {
@@ -549,6 +562,11 @@ pub struct Sandbox {
 
 impl Sandbox {
     /// Build a client from an explicit configuration.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::Credential` when the CA PEM cannot be parsed, and
+    /// `SandboxError::Transport` when the HTTP client cannot be built.
     pub fn new(config: SandboxConfig) -> Result<Self, SandboxError> {
         let mut builder = Client::builder().timeout(REQUEST_TIMEOUT);
         if let Some(pem) = config.ca_pem.as_deref() {
@@ -566,17 +584,24 @@ impl Sandbox {
 
     /// Build from the process environment. The fail-closed path is what makes the worker
     /// refuse to start without a namespace or a digest-pinned image.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::Missing`, `Invalid` or `Credential` from reading the environment, and
+    /// `SandboxError::Credential` or `Transport` from building the client.
     pub fn from_env() -> Result<Self, SandboxError> {
         Self::new(SandboxConfig::from_env()?)
     }
 
     /// The namespace runner Pods are created in.
+    #[must_use]
     pub fn namespace(&self) -> &str {
         &self.config.namespace
     }
 
     /// The deterministic Pod name for a job. A repeated create therefore names the same object
     /// and the API answers `409`, which [`Sandbox::create_run`] treats as a reattach.
+    #[must_use]
     pub fn pod_name(job_id: &str) -> String {
         let mut slug = String::with_capacity(job_id.len());
         for character in job_id.chars() {
@@ -601,6 +626,12 @@ impl Sandbox {
 
     /// The Pod manifest for one job. Public so tests can assert the Restricted-PSS fields
     /// without a cluster.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::Manifest` when the job id is not a valid label value or the spec cannot
+    /// be serialized, and `SandboxError::SpecTooLarge` when the encoded spec exceeds the
+    /// env-size cap.
     pub fn pod_manifest(
         &self,
         job_id: &str,
@@ -762,6 +793,15 @@ impl Sandbox {
     /// A `409 AlreadyExists` is this worker's own retry **only** when the existing Pod carries
     /// our `coding.io/job` label; anything else is refused. A success response naming a Pod
     /// other than the one requested is refused too — that would be someone else's run.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::SourcesNotEnabled` or `SandboxError::ProfileNotEnabled` when the spec
+    /// asks for a capability this worker was not configured with, the manifest and spec-size
+    /// errors [`Self::pod_manifest`] raises, `SandboxError::NotFound`,
+    /// `SandboxError::ForeignPod` or `SandboxError::ForeignPodName` when a `409` names a Pod
+    /// that is not this job's, and `SandboxError::Transport` or `SandboxError::Api` when the
+    /// create request fails.
     pub async fn create_run(
         &self,
         job_id: &str,
@@ -825,6 +865,11 @@ impl Sandbox {
     }
 
     /// Read one Pod's state.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::Transport` when the request does not reach the API, and
+    /// `SandboxError::Api` when it answers a non-success status other than `404`.
     pub async fn state(&self, name: &str) -> Result<PodState, SandboxError> {
         let pod = match self.get_pod(name).await {
             Ok(pod) => pod,
@@ -846,6 +891,12 @@ impl Sandbox {
 
     /// Read a Pod's log, bounded by [`LOG_BYTE_CAP`]. The body is streamed and the read stops
     /// at the cap, so an oversized log is never buffered whole.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::NotFound` when the Pod is gone, `SandboxError::Transport` when the
+    /// request or the streamed body fails, and `SandboxError::Api` for any other non-success
+    /// status.
     pub async fn logs(&self, name: &str, tail_lines: u32) -> Result<String, SandboxError> {
         let path = format!(
             "/api/v1/namespaces/{}/pods/{name}/log?tailLines={tail_lines}",
@@ -893,6 +944,11 @@ impl Sandbox {
     }
 
     /// Delete a Pod. Best effort: a `404` means the reaper or the TTL already got it.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::Transport` when the request fails, and `SandboxError::Api` for a
+    /// non-success status other than `404`.
     pub async fn delete(&self, name: &str) -> Result<(), SandboxError> {
         let path = format!("/api/v1/namespaces/{}/pods/{name}", self.config.namespace);
         let response = self
@@ -915,6 +971,12 @@ impl Sandbox {
     /// Delete runner Pods whose own deadline has passed (`coding.io/reap-at`). A Pod without
     /// that annotation — one created by a version before per-job deadlines — falls back to the
     /// `older_than` age policy. Returns how many Pods were deleted.
+    ///
+    /// # Errors
+    ///
+    /// `SandboxError::Transport` when the list request or its body fails, and
+    /// `SandboxError::Api` when the list answers a non-success status. A failed delete of one
+    /// Pod is logged and not returned.
     pub async fn reap(&self, older_than: Duration) -> Result<usize, SandboxError> {
         // An existence selector on the label; `%2F` is the encoded `/` in `coding.io/job`.
         let path = format!(
@@ -970,7 +1032,7 @@ impl Sandbox {
             match self.delete(name).await {
                 Ok(()) => deleted += 1,
                 Err(error) => {
-                    tracing::warn!(pod = %name, error = %error, "sandbox: reaper delete failed")
+                    tracing::warn!(pod = %name, error = %error, "sandbox: reaper delete failed");
                 }
             }
         }
@@ -1024,6 +1086,7 @@ impl Sandbox {
 
 /// The per-kind resource table. Test and build legs compile things and get the larger tier;
 /// analysis and scan (and every kind that does not run in the sandbox yet) get the smaller one.
+#[must_use]
 pub fn resources_for(kind: JobKind) -> Value {
     let (request_cpu, request_memory, limit_cpu, limit_memory) = match kind {
         JobKind::Test | JobKind::Build | JobKind::Lint | JobKind::Check => ("1", "2Gi", "2", "4Gi"),
@@ -1111,8 +1174,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |duration| duration.as_secs())
 }
 
 fn capped(body: String) -> String {

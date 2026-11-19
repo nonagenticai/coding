@@ -3,7 +3,7 @@
 //! * `POST /api/jobs`          — create (202) — `coding_jobs.create`
 //! * `POST /api/jobs/status`   — read by id in a body (200) — `coding_jobs.get`
 //!
-//! Both paths and methods are exactly what conveyor's ActionSpec declares; the bodies are this
+//! Both paths and methods are exactly what conveyor's `ActionSpec` declares; the bodies are this
 //! service's own contract, frozen by the HTTP tests.
 
 use axum::Json;
@@ -97,6 +97,12 @@ fn invalid_input(error: InputError) -> Response {
 
 /// Read a job by id carried in the body. A POST because conveyor's action engine cannot template
 /// a path and a GET carries no body.
+/// Read a job's current state by the id in the request body.
+///
+/// # Errors
+///
+/// `AppError::BadRequest` for an id that is not a UUID, `AppError::NotFound` when the tenant
+/// does not own the job, and `AppError::Database` when the query fails.
 #[utoipa::path(
     post,
     path = "/api/jobs/status",
@@ -121,6 +127,11 @@ pub async fn job_status(
 }
 
 /// Read a job by path id (human/UI use; same body as `/api/jobs/status`).
+///
+/// # Errors
+///
+/// `AppError::BadRequest` for an id that is not a UUID, `AppError::NotFound` when the tenant
+/// does not own the job, and `AppError::Database` when the query fails.
 #[utoipa::path(
     get,
     path = "/api/jobs/{id}",
@@ -144,6 +155,11 @@ pub async fn get_job(
 
 /// Request cancellation. Queued jobs cancel immediately; running jobs are asked to stop and their
 /// sandbox Pod is deleted by the worker.
+///
+/// # Errors
+///
+/// `AppError::BadRequest` for an id that is not a UUID, `AppError::NotFound` when the tenant
+/// does not own the job, and `AppError::Database` when the update fails.
 #[utoipa::path(
     post,
     path = "/api/jobs/{id}/cancel",
@@ -188,6 +204,11 @@ pub struct JobEventPage {
 ///
 /// M0 returns a JSON page; the streaming (SSE) form lands with the sandbox milestone, when a
 /// streaming dependency is added deliberately rather than by transitive accident.
+///
+/// # Errors
+///
+/// `AppError::BadRequest` for an id that is not a UUID, `AppError::NotFound` when the tenant
+/// does not own the job, and `AppError::Database` when either query fails.
 #[utoipa::path(
     get,
     path = "/api/jobs/{id}/events",
@@ -211,7 +232,7 @@ pub async fn job_events(
     // Tenant-scope first: an unknown job is 404, never an empty page.
     let _ = store::get_job(&state.pool, tenant.as_str(), &id).await?;
     let rows = store::events_since(&state.pool, tenant.as_str(), &id, query.after, 500).await?;
-    let next = rows.last().map(|(seq, _, _)| *seq).unwrap_or(query.after);
+    let next = rows.last().map_or(query.after, |(seq, _, _)| *seq);
     Ok(Json(JobEventPage {
         events: rows
             .into_iter()

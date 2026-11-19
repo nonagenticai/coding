@@ -48,6 +48,10 @@ pub async fn api_health() -> Json<Health> {
 
 /// Readiness. Fails with `503` when the database is unreachable, which is what a rollout should
 /// gate on (unlike liveness).
+///
+/// # Errors
+///
+/// `AppError::Unavailable` when the `SELECT 1` probe fails, which renders as `503`.
 #[utoipa::path(
     get,
     path = "/api/health/ready",

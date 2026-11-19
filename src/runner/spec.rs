@@ -62,12 +62,22 @@ fn default_deadline() -> u64 {
 
 impl RunnerSpec {
     /// Read and validate the spec from the process environment.
+    ///
+    /// # Errors
+    ///
+    /// `SpecError::Missing` when `CODING_JOB_SPEC` is unset or not unicode, plus every error
+    /// [`RunnerSpec::from_json`] raises.
     pub fn from_env() -> Result<Self, SpecError> {
         let raw = std::env::var(SPEC_ENV).map_err(|_| SpecError::Missing)?;
         Self::from_json(&raw)
     }
 
     /// Parse and validate a spec. Split out so the rules are testable without a process env.
+    ///
+    /// # Errors
+    ///
+    /// `SpecError::Json` when `raw` is not a spec-shaped JSON document, and
+    /// `SpecError::Invalid` when a validation rule fails.
     pub fn from_json(raw: &str) -> Result<Self, SpecError> {
         let spec: Self =
             serde_json::from_str(raw).map_err(|err| SpecError::Json(err.to_string()))?;
@@ -76,6 +86,11 @@ impl RunnerSpec {
     }
 
     /// Every rule that makes a spec usable.
+    ///
+    /// # Errors
+    ///
+    /// `SpecError::Invalid` naming the first broken rule: an empty job id, a deadline out of
+    /// range, mutually exclusive source forms, or a source that fails its own rules.
     pub fn validate(&self) -> Result<(), SpecError> {
         if self.job_id.trim().is_empty() {
             return Err(SpecError::Invalid("job_id is empty".to_owned()));
@@ -145,6 +160,7 @@ impl RunnerSpec {
     }
 
     /// Kinds that cannot run without code.
+    #[must_use]
     pub fn needs_source(&self) -> bool {
         matches!(
             self.kind,
@@ -154,6 +170,14 @@ impl RunnerSpec {
 }
 
 /// The source rules, enforced identically here and in the API.
+// reason: one linear rule list; splitting it would scatter the shared error messages.
+#[allow(clippy::too_many_lines)]
+/// Validate one source.
+///
+/// # Errors
+///
+/// A `String` naming the first broken rule: no files, a path that leaves the tree, a repeated
+/// path, or a size over the inline cap.
 pub fn validate_source(source: &Source) -> Result<(), String> {
     match source {
         Source::Inline { files } => {
@@ -310,6 +334,7 @@ fn validate_path(path: &str) -> Result<(), String> {
 }
 
 /// Number of files in a source, for the result's `source` summary.
+#[must_use]
 pub fn file_count(source: &Source) -> usize {
     match source {
         Source::Inline { files } => files.len(),
@@ -319,6 +344,7 @@ pub fn file_count(source: &Source) -> usize {
 }
 
 /// Unused here but part of the shared shape: keeps `InlineFile` imported in one place.
+#[must_use]
 pub fn first_inline_file(source: &Source) -> Option<&InlineFile> {
     match source {
         Source::Inline { files } => files.first(),

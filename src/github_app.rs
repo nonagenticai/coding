@@ -30,7 +30,7 @@ pub const PRIVATE_KEY_PATH_ENV: &str = "CODING_GITHUB_APP_PRIVATE_KEY_PATH";
 
 /// How long a minted installation token is reused. GitHub issues them for an hour; the margin
 /// covers clock skew and the longest clone.
-const TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
+const TOKEN_TTL: Duration = Duration::from_mins(50);
 /// The JWT's lifetime: GitHub rejects anything over 10 minutes.
 const JWT_TTL_SECONDS: u64 = 540;
 /// How far in the past `iat` sits, for a worker whose clock runs slightly fast.
@@ -54,6 +54,11 @@ impl GitHubApp {
     /// Read the App from the environment. `Ok(None)` means "not configured": public clones only.
     /// A *present but broken* configuration is an error, so a typo cannot silently downgrade to
     /// anonymous clones of private repositories.
+    ///
+    /// # Errors
+    ///
+    /// A `String` naming the failure when only some of the three app variables are set, or
+    /// when the private key file cannot be read or is not an RSA key.
     pub fn from_env() -> Result<Option<Self>, String> {
         let read = |name: &str| {
             std::env::var(name)
@@ -70,6 +75,11 @@ impl GitHubApp {
 
     /// The configuration rule, split out so it is testable without mutating the process env
     /// (`#![forbid(unsafe_code)]` rules out `set_var`).
+    ///
+    /// # Errors
+    ///
+    /// A `String` naming the failure when only some of the three values are present, or when
+    /// `key_path` cannot be read or is not an RSA key.
     pub fn from_parts(
         app_id: Option<String>,
         installation_id: Option<String>,
@@ -117,6 +127,11 @@ impl GitHubApp {
     }
 
     /// An installation token, reusing the cached one until shortly before it expires.
+    ///
+    /// # Errors
+    ///
+    /// A `String` naming the failure when the app JWT cannot be signed, the token request
+    /// fails or is refused, or the response is unreadable or carries an empty token.
     pub async fn installation_token(&self) -> Result<String, String> {
         let mut cached = self.cached.lock().await;
         if let Some((token, minted)) = cached.as_ref()
@@ -162,6 +177,11 @@ impl GitHubApp {
     }
 
     /// The App JWT: RS256 over `header.payload`, valid for [`JWT_TTL_SECONDS`].
+    ///
+    /// # Errors
+    ///
+    /// A `String` naming the failure when the system clock is before the Unix epoch or the
+    /// signer rejects the signing input.
     pub fn jwt(&self) -> Result<String, String> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -191,6 +211,7 @@ struct Minted {
 
 /// Whether a clone URL names github.com. Only these receive an installation token: the token is
 /// a credential, and the request chooses the URL.
+#[must_use]
 pub fn is_github_url(url: &str) -> bool {
     let Some(rest) = url
         .strip_prefix("https://")
@@ -206,6 +227,7 @@ pub fn is_github_url(url: &str) -> bool {
 ///
 /// GitHub accepts the token as the password of the `x-access-token` user; the value goes in a
 /// header and never in the URL, which is what a proxy or a log would record.
+#[must_use]
 pub fn git_authorization_header(token: &str) -> String {
     format!(
         "AUTHORIZATION: basic {}",
@@ -319,12 +341,13 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
         for (index, value) in chunk.iter().enumerate() {
             n |= u32::from(*value) << (18 - 6 * index);
         }
-        out.push((n >> 16) as u8);
+        let [_, high, middle, low] = n.to_be_bytes();
+        out.push(high);
         if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
+            out.push(middle);
         }
         if chunk.len() > 3 {
-            out.push(n as u8);
+            out.push(low);
         }
     }
     Ok(out)
@@ -426,9 +449,8 @@ mod tests {
             (Some("2333879".to_owned()), Some("1".to_owned()), None),
             (None, Some("1".to_owned()), Some("/k".to_owned())),
         ] {
-            let error = match GitHubApp::from_parts(parts.0, parts.1, parts.2) {
-                Err(error) => error,
-                Ok(_) => panic!("a half configuration must be refused"),
+            let Err(error) = GitHubApp::from_parts(parts.0, parts.1, parts.2) else {
+                panic!("a half configuration must be refused");
             };
             assert!(error.contains("set together"), "{error}");
         }

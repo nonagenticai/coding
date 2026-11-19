@@ -3,11 +3,13 @@
 //! The tenant arrives in `X-Tenant-Id`, set by the trusted edge in front of this service
 //! (gateway / licence introspection), exactly like the Python services' `X-Tenant-*`
 //! headers. The service TRUSTS it, so it must only be reachable through that edge
-//! (mesh AuthorizationPolicy at onboarding). Never derive a tenant from a licence
+//! (mesh `AuthorizationPolicy` at onboarding). Never derive a tenant from a licence
 //! `subject_id`.
 //!
 //! Use it as a handler argument: `async fn list(tenant: TenantId, ...)`, and document the
-//! header in OpenAPI with `params(TenantHeader)` on the `#[utoipa::path]`.
+//! header in `OpenAPI` with `params(TenantHeader)` on the `#[utoipa::path]`.
+
+use std::future::Future;
 
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
@@ -25,18 +27,13 @@ const MAX_LEN: usize = 128;
 pub struct TenantId(pub String);
 
 impl TenantId {
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
-}
 
-impl FromRequestParts<crate::AppState> for TenantId {
-    type Rejection = AppError;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &crate::AppState,
-    ) -> Result<Self, Self::Rejection> {
+    /// The extraction itself: pure header inspection, so no future is needed.
+    fn from_parts(parts: &Parts, state: &crate::AppState) -> Result<Self, AppError> {
         let Some(raw) = parts.headers.get(TENANT_HEADER) else {
             // Fail-closed unless a deployment deliberately names a default tenant for callers
             // that sit inside the cluster with no trusted edge (conveyor).
@@ -65,6 +62,18 @@ impl FromRequestParts<crate::AppState> for TenantId {
             )));
         }
         Ok(TenantId(value.to_owned()))
+    }
+}
+
+impl FromRequestParts<crate::AppState> for TenantId {
+    type Rejection = AppError;
+
+    // reason: the extractor does no I/O, so the future is ready immediately.
+    fn from_request_parts(
+        parts: &mut Parts,
+        state: &crate::AppState,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        std::future::ready(Self::from_parts(parts, state))
     }
 }
 

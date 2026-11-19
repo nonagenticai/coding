@@ -4,7 +4,7 @@ pub mod sources;
 
 use axum::Json;
 
-/// The served OpenAPI document. Not registered through `routes!` (that would document the
+/// The served `OpenAPI` document. Not registered through `routes!` (that would document the
 /// document endpoint recursively); clients fetch it from here.
 #[utoipa::path(
     get,

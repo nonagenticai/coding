@@ -22,7 +22,7 @@ pub mod spec;
 
 use crate::domain::{JobKind, Profile};
 
-/// Where the runner image keeps the CPython it preinstalled for the Python profile. The image
+/// Where the runner image keeps the `CPython` it preinstalled for the Python profile. The image
 /// installs it read-only; [`crate::runner::exec`] points uv at it for every Python step.
 pub const PYTHON_INSTALL_DIR: &str = "/opt/uv/python";
 
@@ -54,6 +54,7 @@ pub struct Planned {
 /// The estate's test harnesses fail closed without `TEST_DATABASE_URL`, so a kind that runs a
 /// test suite gets a throwaway cluster; a kind that only formats, lints or compiles does not pay
 /// for one. [`Planned::needs_database`] decides *which step* starts it.
+#[must_use]
 pub fn needs_database(kind: JobKind) -> bool {
     matches!(kind, JobKind::Test | JobKind::Check)
 }
@@ -63,6 +64,7 @@ pub fn needs_database(kind: JobKind) -> bool {
 /// The estate's harnesses read `TEST_REDIS_URL` / `REDIS_URL` and many fail closed without one, so
 /// a kind that runs a test suite gets a throwaway server. [`Planned::needs_redis`] decides *which
 /// step* starts it.
+#[must_use]
 pub fn needs_redis(kind: JobKind) -> bool {
     matches!(kind, JobKind::Test | JobKind::Check)
 }
@@ -263,6 +265,7 @@ const PYTHON_CHECK: &[Planned] = &[
 /// The command plan for a `(profile, kind)` pair. `None` means this runner cannot execute it —
 /// an unimplemented kind, or a kind the profile has no gate for — and the runner reports
 /// `unsupported` rather than guessing.
+#[must_use]
 pub fn plan(profile: Profile, kind: JobKind) -> Option<&'static [Planned]> {
     Some(match (profile, kind) {
         (Profile::Rust, JobKind::Test) => RUST_TEST,
@@ -273,9 +276,8 @@ pub fn plan(profile: Profile, kind: JobKind) -> Option<&'static [Planned]> {
         (Profile::Python, JobKind::Lint) => PYTHON_LINT,
         (Profile::Python, JobKind::Check) => PYTHON_CHECK,
         // Python has no `build` gate in the estate's archetype. Inventing one would produce a
-        // verdict CI never gives, so this runner says `unsupported` instead.
-        (Profile::Python, JobKind::Build) => return None,
-        // Every other kind belongs to a later milestone (analysis, scans, GitHub, parity).
+        // verdict CI never gives, so this runner says `unsupported` instead. Every other kind
+        // belongs to a later milestone (analysis, scans, GitHub, parity).
         _ => return None,
     })
 }

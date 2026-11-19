@@ -153,18 +153,21 @@ impl RunnerResult {
     }
 
     /// Attach the source summary of a single-source job.
+    #[must_use]
     pub fn with_source(mut self, source: Option<SourceInfo>) -> Self {
         self.source = source;
         self
     }
 
     /// Attach the sources of a multi-source job.
+    #[must_use]
     pub fn with_sources(mut self, sources: Vec<SourceInfo>) -> Self {
         self.sources = sources;
         self
     }
 
     /// Attach an error explanation.
+    #[must_use]
     pub fn with_error(mut self, error: impl Into<String>) -> Self {
         self.error = Some(error.into());
         self
@@ -175,6 +178,7 @@ impl RunnerResult {
 ///
 /// Returns `true` when the line was written. A `false` return is the only case where the process
 /// should exit non-zero: no result line means the worker has nothing to read.
+#[must_use]
 pub fn emit(result: &RunnerResult) -> bool {
     // A child that exited without a trailing newline must not fuse with our JSON line.
     println!();
