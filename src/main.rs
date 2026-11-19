@@ -22,8 +22,18 @@ use coding::domain::JobKind;
 use coding::error::StartupError;
 use coding::{AppState, app, db, openapi, telemetry, worker};
 
+/// The version string carries the commit it was built from (`build.rs`). A developer machine runs
+/// a COPY of one build, and nothing ties that copy to `origin/main`: a client from before #17
+/// failed a push open on a 500 the current client rides out, and both printed `0.1.0`. Reporting
+/// the build makes a stale client identifiable from a log instead of from a mystery.
+const BUILD_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " build ",
+    env!("CODING_BUILD_STAMP")
+);
+
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version = BUILD_VERSION, about)]
 struct Cli {
     /// Print the `OpenAPI` document as JSON to stdout and exit.
     #[arg(long)]
