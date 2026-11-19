@@ -1086,10 +1086,19 @@ impl Sandbox {
 
 /// The per-kind resource table. Test and build legs compile things and get the larger tier;
 /// analysis and scan (and every kind that does not run in the sandbox yet) get the smaller one.
+///
+/// ⚠️ The CPU **limit** is what bounds cargo: inside a cgroup, `available_parallelism()` reports
+/// the quota, so a 2-core limit runs at most ~2 rustc jobs however large the node is. Measured on
+/// `coding` itself (2026-11-19): clippy peaked at 1426m of a 2000m limit and took ~149 s, i.e. the
+/// limit, not the node, was the ceiling. The limit is raised without touching the request on
+/// purpose — the `coding-runs` `ResourceQuota` caps `requests.cpu` at 8, so raising the *request*
+/// would cut concurrency from 8 jobs to 4, while `limits.cpu` is not capped by the quota at all.
+/// The `LimitRange` ceiling in `coding-runs` is 6 CPU / 12Gi; a value above that is admitted by the
+/// API and then refused at Pod creation, so keep this table inside it.
 #[must_use]
 pub fn resources_for(kind: JobKind) -> Value {
     let (request_cpu, request_memory, limit_cpu, limit_memory) = match kind {
-        JobKind::Test | JobKind::Build | JobKind::Lint | JobKind::Check => ("1", "2Gi", "2", "4Gi"),
+        JobKind::Test | JobKind::Build | JobKind::Lint | JobKind::Check => ("1", "2Gi", "4", "4Gi"),
         _ => ("500m", "1Gi", "1", "2Gi"),
     };
     json!({
@@ -1192,6 +1201,60 @@ fn capped(body: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `coding-runs` carries a `LimitRange` of at most 6 CPU / 12Gi per container. A value above it
+    /// is accepted by the API and then refused when the Pod is created — a job that can never run,
+    /// and the failure surfaces as `sandbox_error` rather than as anything about the code. Pin the
+    /// table against that ceiling here so a future bump fails in review and not in production.
+    #[test]
+    fn every_kind_fits_the_coding_runs_limit_range() {
+        fn millicores(raw: &str) -> i64 {
+            match raw.strip_suffix('m') {
+                Some(value) => value.parse().expect("millicores"),
+                None => raw.parse::<i64>().expect("cores") * 1000,
+            }
+        }
+        fn mebibytes(raw: &str) -> i64 {
+            match raw.strip_suffix("Gi") {
+                Some(value) => value.parse::<i64>().expect("GiB") * 1024,
+                None => raw.parse::<i64>().expect("MiB"),
+            }
+        }
+
+        for kind in [JobKind::Test, JobKind::Build, JobKind::Lint, JobKind::Check] {
+            let resources = resources_for(kind);
+            let request_cpu =
+                millicores(resources["requests"]["cpu"].as_str().expect("request cpu"));
+            let limit_cpu = millicores(resources["limits"]["cpu"].as_str().expect("limit cpu"));
+            let request_memory = mebibytes(
+                resources["requests"]["memory"]
+                    .as_str()
+                    .expect("request memory"),
+            );
+            let limit_memory = mebibytes(
+                resources["limits"]["memory"]
+                    .as_str()
+                    .expect("limit memory"),
+            );
+
+            assert!(
+                request_cpu <= limit_cpu,
+                "{kind:?}: a request above the limit"
+            );
+            assert!(
+                request_memory <= limit_memory,
+                "{kind:?}: a memory request above the limit"
+            );
+            assert!(
+                limit_cpu <= 6_000,
+                "{kind:?}: {limit_cpu}m is over the 6 CPU LimitRange ceiling"
+            );
+            assert!(
+                limit_memory <= 12 * 1024,
+                "{kind:?}: {limit_memory}Mi is over the 12Gi LimitRange ceiling"
+            );
+        }
+    }
 
     #[test]
     fn a_short_log_is_returned_unchanged() {
