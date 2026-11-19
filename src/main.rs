@@ -84,6 +84,10 @@ struct CheckCmd {
     /// rust; pyproject.toml + uv.lock is python.
     #[arg(long, value_enum, default_value_t = client::ProfileArg::Auto)]
     profile: client::ProfileArg,
+    /// Which snapshot to check: the working tree (default), the index (what a commit would
+    /// record), or HEAD (what a push sends).
+    #[arg(long, value_enum, default_value_t = client::pack::Snapshot::Worktree)]
+    snapshot: client::pack::Snapshot,
     /// How long the job may run inside the Pod, in seconds.
     #[arg(long, default_value_t = 1800)]
     timeout: u32,
@@ -111,7 +115,8 @@ enum HookAction {
         /// Which git hook to write.
         #[arg(long, value_enum, default_value_t = HookName::PrePush)]
         hook: HookName,
-        /// The job kind the hook runs. Default: check for pre-push, lint for pre-commit.
+        /// The pre-commit job kind (default: lint). The pre-push hook ignores it and runs
+        /// `build` then `test` against HEAD as two separate gates.
         #[arg(long, value_enum)]
         kind: Option<KindArg>,
         /// Replace a hook that coding did not write.
@@ -178,6 +183,7 @@ async fn main() -> ExitCode {
                 token: cmd.token,
                 kind: cmd.kind.into(),
                 profile: cmd.profile,
+                snapshot: cmd.snapshot,
                 timeout_seconds: cmd.timeout,
                 json: cmd.json,
                 dry_run: cmd.dry_run,
