@@ -56,6 +56,15 @@ warning, because a gate that blocks work when the service is down gets deleted. 
 `coding.url` / `coding.tenant` (and the client reads `coding.token`) from git config and refuses
 to overwrite or remove a hook it did not write (use `--force`).
 
+### What the gate is not
+
+A green gate is evidence about the checks it ran, never CI parity. It does not run docker or
+testcontainers; it does not know a repository's own CI `test_command` (agent's
+`scripts/test-lean.sh` is not what runs); it does not run `cargo audit` or a secret scan. A Pod
+compiles with one `CARGO_BUILD_JOBS`, so a large workspace can fail to finish inside its budget
+— that is exit 3, a fail-open, not a verdict. Where `rbuild --gate` exists it remains the
+authoritative local mirror. `check` is `lint` followed by `test`, in one Pod.
+
 During polling, a `500`/`502`/`503`/`504` from a rolling deployment is retried for a bounded window
 (about 12 s) before it is treated as infrastructure: a transient rollout does not fail the gate, a
 persistent one still exits 3.
