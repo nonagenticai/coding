@@ -55,6 +55,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Per-request timeout. The upload gets its own, longer one.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+/// Poll statuses worth retrying: an ingress 502/503/504 while the app's pods restart, and a 500
+/// from the database pool while it reconnects (measured 2026-11-19: the gate's own CI job hit a
+/// 503, then a 500 "database error", during the app's image-automation rollout). A persistent one
+/// is still an infrastructure failure — the retry is bounded.
+const TRANSIENT_POLL_STATUSES: [u16; 4] = [500, 502, 503, 504];
+/// Consecutive transient polls tolerated before giving up (2 s apart: about 12 s).
+const TRANSIENT_POLL_LIMIT: u32 = 6;
 
 /// One `coding check` invocation.
 #[derive(Debug)]
@@ -329,6 +336,11 @@ fn authorize(request: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::
     }
 }
 
+/// Whether a poll status is worth retrying (a rolling deployment, not a verdict).
+fn is_transient_poll_status(status: reqwest::StatusCode) -> bool {
+    TRANSIENT_POLL_STATUSES.contains(&status.as_u16())
+}
+
 /// How many attempts a request that has not reach the app yet gets.
 const TRANSPORT_ATTEMPTS: u32 = 3;
 /// The first wait between those attempts; each later wait doubles.
@@ -406,10 +418,13 @@ async fn poll_to_verdict(
     let budget = Duration::from_secs(u64::from(timeout_seconds) + 120);
     let mut last = String::new();
     let mut last_transport_error = String::new();
+    let mut transient_polls = 0u32;
     loop {
         // A failed *read* is transient by nature — the tunnel can blip — so it is reported once
         // and the loop keeps going until its budget runs out. A refusal from the app still ends
-        // the poll at once through read_json, because that is the app answering.
+        // the poll at once through read_json, because that is the app answering. The exception is
+        // a bounded window of 5xx statuses that a rolling deployment produces (see
+        // TRANSIENT_POLL_STATUSES): those are retried like a transport blip.
         match authorize(
             client
                 .get(format!("{base}/api/jobs/{job_id}"))
@@ -420,14 +435,35 @@ async fn poll_to_verdict(
         .await
         {
             Ok(response) => {
-                let job = read_json(response).await?;
-                let status = created_status(&job);
-                if status != last {
-                    println!("  [{:>5.1}s] {status}", started.elapsed().as_secs_f32());
-                    last.clone_from(&status);
-                }
-                if matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
-                    return Ok(job);
+                let status = response.status();
+                if is_transient_poll_status(status) {
+                    transient_polls += 1;
+                    let message = format!(
+                        "the app answered {status} (transient; {transient_polls}/{TRANSIENT_POLL_LIMIT})"
+                    );
+                    if message != last_transport_error {
+                        eprintln!(
+                            "  [{:>5.1}s] {message}; still polling",
+                            started.elapsed().as_secs_f32()
+                        );
+                        last_transport_error = message;
+                    }
+                    if transient_polls > TRANSIENT_POLL_LIMIT {
+                        return Err(ClientError::Infra(format!(
+                            "the app kept answering {status} for {transient_polls} polls"
+                        )));
+                    }
+                } else {
+                    transient_polls = 0;
+                    let job = read_json(response).await?;
+                    let status = created_status(&job);
+                    if status != last {
+                        println!("  [{:>5.1}s] {status}", started.elapsed().as_secs_f32());
+                        last.clone_from(&status);
+                    }
+                    if matches!(status.as_str(), "succeeded" | "failed" | "cancelled") {
+                        return Ok(job);
+                    }
                 }
             }
             Err(error) => {
@@ -764,6 +800,22 @@ mod tests {
         );
         assert_eq!(resolve_token(None, Some("  ".to_owned())), None);
         assert_eq!(resolve_token(None, None), None);
+    }
+
+    #[test]
+    fn only_a_rolling_deployments_statuses_are_transient_polls() {
+        for status in [500, 502, 503, 504] {
+            assert!(
+                is_transient_poll_status(reqwest::StatusCode::from_u16(status).unwrap()),
+                "{status} must be retried"
+            );
+        }
+        for status in [200, 201, 401, 403, 404, 409, 429] {
+            assert!(
+                !is_transient_poll_status(reqwest::StatusCode::from_u16(status).unwrap()),
+                "{status} is an answer, not a rollout"
+            );
+        }
     }
 
     #[test]

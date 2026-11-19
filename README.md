@@ -56,6 +56,10 @@ warning, because a gate that blocks work when the service is down gets deleted. 
 `coding.url` / `coding.tenant` (and the client reads `coding.token`) from git config and refuses
 to overwrite or remove a hook it did not write (use `--force`).
 
+During polling, a `500`/`502`/`503`/`504` from a rolling deployment is retried for a bounded window
+(about 12 s) before it is treated as infrastructure: a transient rollout does not fail the gate, a
+persistent one still exits 3.
+
 The hooks are snapshot- and gate-aware: the pre-push hook runs `build` and then `test` against
 **HEAD** as two separate requests, so a build failure is reported as a build failure and the test
 gate is marked not run; the pre-commit hook runs its `--kind` (default `lint`) against the
