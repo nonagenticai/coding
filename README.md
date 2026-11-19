@@ -123,6 +123,43 @@ support (`CODING_RUNNER_MULTI_SOURCE` unset or not affirmative) and refuses any 
 profile is not listed in `CODING_RUNNER_PROFILES` — so a mixed rollout fails with a legible
 message rather than an `invalid job spec` from the Pod.
 
+### OpenAPI parity (`parity_openapi`)
+
+A parity job compares a ported **target** against one or more **origins**, using the OpenAPI
+document each source carries at its root (`openapi.json`). Nothing is executed: the comparison
+runs in-process in the runner, on the materialised trees, and no Pod command is planned.
+
+```json
+{"kind": "parity_openapi", "input": {
+  "sources": [
+    {"name": "target",   "profile": "rust",   "source": {"kind": "git", "url": "https://github.com/o/svc-rs", "ref": "<sha>"}},
+    {"name": "source-1", "profile": "python", "source": {"kind": "git", "url": "https://github.com/o/svc-py", "ref": "<sha>"}}
+  ],
+  "parity": {"target": "target", "routes": [{"method": "GET", "path": "/api/jobs"}]}
+}}
+```
+
+- `parity.target` names one of the job's sources (default `target`); every other source is an
+  origin. At least two sources are required.
+- `routes` (1–500) is the **slice form**: every named route must be declared by an origin, be
+  present in the target with the same method and path, and be equal in parameters, request body
+  and responses. A route the target declares that the slice did not name also fails.
+- With `routes` empty the **union form** runs: every route the origins declare must be served by
+  the target, equal as above. Target-only routes are reported (`extra`) and do not fail.
+
+Equality is computed on shape: local `$ref`s are resolved first (an external `$ref` is a named
+failure), and annotative keys are ignored (`description`, `summary`, `title`, `example`,
+`examples`, `externalDocs`, `operationId`, `tags`, `deprecated`, `servers`, `security`,
+`callbacks`, `x-*`). The two nullability spellings — 3.0's `nullable: true` /
+`anyOf: [X, {"type": "null"}]` and 3.1's `type: [..., "null"]` — fold to the 3.1 union form,
+because they admit exactly the same instances. `required`, `enum` and a union `type` compare as
+sets; everything else compares verbatim, so one changed field fails at its JSON Pointer.
+
+The result carries `parity` beside `checks`: `mode`, `counts` (`routes`, `equal`, `differ`,
+`missing`, `extra`), one entry per route with its differences (`source`, `pointer`, `expected`,
+`actual`), and `truncated`. The report states what was computed and adds no judgement; it is
+capped at 96 KiB, and the counts always describe the whole comparison.
+
 The worker runs up to `CODING_WORKER_CONCURRENCY` jobs at once (default 4). Every claim carries
 its own fencing token, so a slot that lost its lease can never heartbeat, complete, fail or
 cancel the job a newer claim owns, and a slot that panics cannot leave its lease renewing;

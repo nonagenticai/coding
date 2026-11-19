@@ -239,6 +239,115 @@ pub struct JobInput {
     /// App's installation token never reaches untrusted code. Only `github_op` may set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputSpec>,
+    /// The parity contract for `parity_openapi`: which named source is the rewrite's contract
+    /// (the others are pinned origins) and, optionally, the slice's routes. Only
+    /// `parity_openapi` may set it. Every source carries its `OpenAPI` document at `openapi.json`
+    /// (the fixture convention); the runner reads them from the materialised trees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parity: Option<ParitySpec>,
+}
+
+/// The parity contract for one `parity_openapi` job.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ParitySpec {
+    /// The named source that carries the rewrite's contract; every other source is a pinned
+    /// origin. Default `target`.
+    #[serde(default = "default_parity_target")]
+    pub target: String,
+    /// The routes the slice names. Empty means the union of every origin's document (the
+    /// `rewrite_parity_qa` form); non-empty means exactly those routes, and a route in the
+    /// target that is not named fails (the `rewrite_slice` form).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<ParityRoute>,
+}
+
+fn default_parity_target() -> String {
+    "target".to_owned()
+}
+
+/// One route a slice names: the HTTP method and the `OpenAPI` path.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ParityRoute {
+    pub method: ParityMethod,
+    pub path: String,
+}
+
+/// The HTTP methods an `OpenAPI` path item declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum ParityMethod {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+    Head,
+    Options,
+}
+
+impl ParityMethod {
+    /// The wire/`OpenAPI` spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Get => "GET",
+            Self::Post => "POST",
+            Self::Put => "PUT",
+            Self::Patch => "PATCH",
+            Self::Delete => "DELETE",
+            Self::Head => "HEAD",
+            Self::Options => "OPTIONS",
+        }
+    }
+}
+
+/// A parity job compares one target against its origins; the union needs at least one origin.
+const MIN_PARITY_SOURCES: usize = 2;
+/// Bounds on what one job may ask the runner to compare.
+const MAX_PARITY_ROUTES: usize = 500;
+const MAX_PARITY_PATH_BYTES: usize = 500;
+
+/// Why a [`ParitySpec`] was refused. The target must name a source in THIS job, because the
+/// runner reads the document from that source's materialised tree.
+fn validate_parity(parity: &ParitySpec, sources: &[NamedSource]) -> Result<(), InputError> {
+    if sources.len() < MIN_PARITY_SOURCES {
+        return Err(InputError::new(format!(
+            "kind parity_openapi compares a target against at least one origin: input.sources \
+             must carry {MIN_PARITY_SOURCES} or more named sources"
+        )));
+    }
+    if !sources.iter().any(|source| source.name == parity.target) {
+        return Err(InputError::new(format!(
+            "input.parity.target {:?} names no source in input.sources",
+            parity.target
+        )));
+    }
+    if parity.routes.len() > MAX_PARITY_ROUTES {
+        return Err(InputError::new(format!(
+            "input.parity.routes carries {} routes, over the {MAX_PARITY_ROUTES}-route cap",
+            parity.routes.len()
+        )));
+    }
+    for route in &parity.routes {
+        let valid = route.path.starts_with('/')
+            && route.path.len() <= MAX_PARITY_PATH_BYTES
+            && !route.path.contains("..")
+            && !route.path.chars().any(char::is_whitespace)
+            && !route.path.chars().any(char::is_control)
+            && route.path.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-' | b'{' | b'}')
+            });
+        if !valid {
+            return Err(InputError::new(format!(
+                "input.parity.routes path {:?} must be an OpenAPI path: starts '/', \
+                 1..={MAX_PARITY_PATH_BYTES} bytes of [A-Za-z0-9/._-{{}}], no whitespace, no '..'",
+                route.path
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Where a `github_op` delivery writes. Bounds are enforced before a row exists, because the
@@ -484,6 +593,20 @@ impl JobInput {
             )));
         }
         self.validate_shape()?;
+        if kind == JobKind::ParityOpenapi {
+            let Some(parity) = &self.parity else {
+                return Err(InputError::new(
+                    "kind parity_openapi requires input.parity {target, routes?}: there is \
+                     nothing to compare without it",
+                ));
+            };
+            validate_parity(parity, &self.sources)?;
+        } else if self.parity.is_some() {
+            return Err(InputError::new(format!(
+                "kind {} must not set input.parity; only parity_openapi compares",
+                kind.as_str()
+            )));
+        }
         if self.source.is_none() && self.sources.is_empty() && needs_source(kind) {
             return Err(InputError::new(format!(
                 "kind {} requires input.source or input.sources",
@@ -855,6 +978,7 @@ mod tests {
         JobInput {
             profile: Profile::Rust,
             output: None,
+            parity: None,
             sources: Vec::new(),
             source: Some(Source::Inline {
                 files: files
@@ -872,6 +996,7 @@ mod tests {
         JobInput {
             profile: Profile::Rust,
             output: None,
+            parity: None,
             sources: Vec::new(),
             source: Some(Source::Git {
                 url: url.to_owned(),
@@ -924,13 +1049,18 @@ mod tests {
             JobKind::Scan,
             JobKind::DependencyUpgrade,
             JobKind::CrateMap,
-            JobKind::ParityOpenapi,
             JobKind::ParitySchema,
             JobKind::ParityBehaviour,
             JobKind::ParityPerf,
         ] {
             assert!(JobInput::default().validate(kind).is_ok(), "{kind:?}");
         }
+        // `parity_openapi` is no longer a no-op placeholder either: it needs its contract.
+        assert!(
+            JobInput::default()
+                .validate(JobKind::ParityOpenapi)
+                .is_err()
+        );
         // `github_op` is no longer a no-op placeholder: it needs an output spec and an upload.
         assert!(JobInput::default().validate(JobKind::GithubOp).is_err());
     }
@@ -1069,6 +1199,7 @@ mod tests {
             let input = JobInput {
                 profile: Profile::Rust,
                 output: None,
+                parity: None,
                 sources: Vec::new(),
                 source: Some(Source::Git {
                     url: "https://host/repo".to_owned(),
@@ -1087,6 +1218,7 @@ mod tests {
         JobInput {
             profile: Profile::Rust,
             output: None,
+            parity: None,
             sources: Vec::new(),
             source: Some(Source::Upload {
                 id: id.to_owned(),
@@ -1111,6 +1243,7 @@ mod tests {
         JobInput {
             profile: Profile::Rust,
             output: output_spec,
+            parity: None,
             source,
             sources: Vec::new(),
         }
@@ -1226,6 +1359,158 @@ mod tests {
         assert!(error.message.contains("output.body"), "{}", error.message);
     }
 
+    fn route(method: ParityMethod, path: &str) -> ParityRoute {
+        ParityRoute {
+            method,
+            path: path.to_owned(),
+        }
+    }
+
+    fn parity(routes: Vec<ParityRoute>, target: &str) -> ParitySpec {
+        ParitySpec {
+            target: target.to_owned(),
+            routes,
+        }
+    }
+
+    fn parity_job(spec: Option<ParitySpec>, list: Vec<NamedSource>) -> JobInput {
+        JobInput {
+            profile: Profile::Rust,
+            output: None,
+            parity: spec,
+            sources: list,
+            source: None,
+        }
+    }
+
+    fn origin_and_target() -> Vec<NamedSource> {
+        vec![
+            named("target", Profile::Rust, "main"),
+            named("source-1", Profile::Python, "abc123"),
+        ]
+    }
+
+    #[test]
+    fn parity_openapi_requires_the_spec_and_a_named_target() {
+        let slice = parity_job(
+            Some(parity(
+                vec![route(ParityMethod::Get, "/api/jobs")],
+                "target",
+            )),
+            origin_and_target(),
+        );
+        assert!(slice.validate(JobKind::ParityOpenapi).is_ok());
+        // The union form names no routes; it is still a parity job.
+        let union = parity_job(Some(parity(Vec::new(), "target")), origin_and_target());
+        assert!(union.validate(JobKind::ParityOpenapi).is_ok());
+
+        // Without the spec there is nothing to compare.
+        let none = parity_job(None, origin_and_target());
+        let error = reject(&none, JobKind::ParityOpenapi);
+        assert!(error.message.contains("input.parity"), "{}", error.message);
+        // The runner reads the document from the target's tree, so it must name one of THIS
+        // job's sources — not a source that exists in some other job.
+        let unknown = parity_job(Some(parity(Vec::new(), "origin")), origin_and_target());
+        let error = reject(&unknown, JobKind::ParityOpenapi);
+        assert!(
+            error.message.contains("names no source"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn parity_compares_a_target_with_at_least_one_origin() {
+        let one = parity_job(
+            Some(parity(Vec::new(), "target")),
+            vec![named("target", Profile::Rust, "main")],
+        );
+        let error = reject(&one, JobKind::ParityOpenapi);
+        assert!(error.message.contains("2 or more"), "{}", error.message);
+    }
+
+    #[test]
+    fn parity_is_refused_on_every_other_kind() {
+        let input = parity_job(Some(parity(Vec::new(), "target")), origin_and_target());
+        for kind in [JobKind::Test, JobKind::Lint, JobKind::Build, JobKind::Check] {
+            let error = reject(&input, kind);
+            assert!(
+                error.message.contains("only parity_openapi"),
+                "{kind:?}: {}",
+                error.message
+            );
+        }
+    }
+
+    #[test]
+    fn the_parity_routes_are_bounded() {
+        let too_many = vec![route(ParityMethod::Get, "/a"); MAX_PARITY_ROUTES + 1];
+        let error = reject(
+            &parity_job(Some(parity(too_many, "target")), origin_and_target()),
+            JobKind::ParityOpenapi,
+        );
+        assert!(error.message.contains("over the"), "{}", error.message);
+        for bad in [
+            "",
+            "api/jobs",
+            "/api jobs",
+            "/api/../jobs",
+            "/api/jobs?x=1",
+            "/api/jo\u{1}s",
+            "/api/%2e%2e",
+        ] {
+            let input = parity_job(
+                Some(parity(vec![route(ParityMethod::Get, bad)], "target")),
+                origin_and_target(),
+            );
+            let error = reject(&input, JobKind::ParityOpenapi);
+            assert!(
+                error.message.contains("OpenAPI path"),
+                "{bad:?}: {}",
+                error.message
+            );
+        }
+        let long = format!("/{}", "a".repeat(MAX_PARITY_PATH_BYTES));
+        let input = parity_job(
+            Some(parity(vec![route(ParityMethod::Get, &long)], "target")),
+            origin_and_target(),
+        );
+        let error = reject(&input, JobKind::ParityOpenapi);
+        assert!(error.message.contains("OpenAPI path"), "{}", error.message);
+        // A templated path is the normal form and stays valid.
+        let templated = parity_job(
+            Some(parity(
+                vec![route(ParityMethod::Get, "/api/jobs/{id}")],
+                "target",
+            )),
+            origin_and_target(),
+        );
+        assert!(templated.validate(JobKind::ParityOpenapi).is_ok());
+    }
+
+    #[test]
+    fn a_parity_spec_round_trips_on_the_wire() {
+        // The target defaults to "target", the name the fixtures use.
+        let spec: ParitySpec = serde_json::from_value(serde_json::json!({"routes": []})).unwrap();
+        assert_eq!(spec.target, "target");
+
+        let input = parity_job(
+            Some(parity(
+                vec![route(ParityMethod::Delete, "/api/jobs/{id}")],
+                "target",
+            )),
+            origin_and_target(),
+        );
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value["parity"]["target"], "target");
+        assert_eq!(value["parity"]["routes"][0]["method"], "DELETE");
+        assert_eq!(value["parity"]["routes"][0]["path"], "/api/jobs/{id}");
+        // The union form sends no routes key at all, so an older reader never sees an empty list.
+        let union = parity_job(Some(parity(Vec::new(), "target")), origin_and_target());
+        let value = serde_json::to_value(&union).unwrap();
+        assert!(value["parity"].get("routes").is_none());
+    }
+
     #[test]
     fn an_upload_source_names_only_its_id() {
         assert!(
@@ -1257,6 +1542,7 @@ mod tests {
         let input = JobInput {
             profile: Profile::Rust,
             output: None,
+            parity: None,
             sources: Vec::new(),
             source: Some(Source::Git {
                 url: "https://github.com/o/r".to_owned(),
@@ -1330,6 +1616,7 @@ mod tests {
         JobInput {
             profile: Profile::Rust,
             output: None,
+            parity: None,
             source: None,
             sources: list,
         }

@@ -10,6 +10,7 @@ pub mod deliver;
 pub mod domain;
 pub mod error;
 pub mod github_app;
+pub mod parity;
 pub mod routes;
 pub mod runner;
 pub mod sandbox;

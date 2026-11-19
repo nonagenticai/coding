@@ -138,6 +138,12 @@ pub struct RunnerResult {
     /// Compilation-cache counters, when a cache was configured and it answered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheStats>,
+    /// The computed `OpenAPI` comparison, for `parity_openapi` only. It is bounded at construction
+    /// ([`crate::parity::Report`] caps itself), because [`bounded_line`] can only trim
+    /// `checks[].output_tail` — a report dropped wholesale would erase the difference set the
+    /// caller came for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parity: Option<crate::parity::Report>,
     /// Log-read metadata.
     pub log: LogInfo,
 }
@@ -153,6 +159,7 @@ impl RunnerResult {
             sources: Vec::new(),
             error: None,
             cache: None,
+            parity: None,
             log: LogInfo { truncated: false },
         }
     }
@@ -214,6 +221,14 @@ fn bounded_line(result: &RunnerResult) -> Option<String> {
             result.checks[index].output_tail = Some(TAIL_DROPPED.to_owned());
             line = serialise(&result)?;
         }
+    }
+    // A parity report caps itself when it is built, so this only fires if that cap ever regresses:
+    // the counts and the verdict survive, the per-route detail does not.
+    if line.len() > RESULT_LINE_BUDGET
+        && let Some(report) = result.parity.as_mut()
+    {
+        report.drop_entries();
+        line = serialise(&result)?;
     }
     Some(line)
 }
