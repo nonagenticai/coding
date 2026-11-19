@@ -75,6 +75,9 @@ struct CheckCmd {
     /// The tenant to attribute the job to. Falls back to CODING_TENANT, then `local`.
     #[arg(long)]
     tenant: Option<String>,
+    /// The licence bearer token. Falls back to CODING_TOKEN, then `git config coding.token`.
+    #[arg(long, env = "CODING_TOKEN")]
+    token: Option<String>,
     #[arg(long, value_enum, default_value_t = KindArg::Check)]
     kind: KindArg,
     /// The toolchain profile to run. `auto` reads the packed tree: Cargo.toml + Cargo.lock is
@@ -172,6 +175,7 @@ async fn main() -> ExitCode {
             let code = client::check(CheckArgs {
                 url: cmd.url,
                 tenant: cmd.tenant,
+                token: cmd.token,
                 kind: cmd.kind.into(),
                 profile: cmd.profile,
                 timeout_seconds: cmd.timeout,
