@@ -1095,6 +1095,12 @@ impl Sandbox {
 /// would cut concurrency from 8 jobs to 4, while `limits.cpu` is not capped by the quota at all.
 /// The `LimitRange` ceiling in `coding-runs` is 6 CPU / 12Gi; a value above that is admitted by the
 /// API and then refused at Pod creation, so keep this table inside it.
+///
+/// ⚠️ CPU and memory are coupled through cargo: a larger CPU *limit* raises the job count cargo
+/// derives from the cgroup, so raising CPU without memory buys SIGKILLs on heavy workspaces
+/// (measured 2026-11-19 on `agent`: four rustc jobs over a 4 GiB limit). The runner bounds that
+/// coupling itself with `CARGO_BUILD_JOBS` — see `runner::exec::run_child`. Raise both together or
+/// neither.
 #[must_use]
 pub fn resources_for(kind: JobKind) -> Value {
     let (request_cpu, request_memory, limit_cpu, limit_memory) = match kind {
