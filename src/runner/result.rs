@@ -54,7 +54,12 @@ pub struct Check {
 }
 
 /// How much of one check's output travels back in the result.
-pub const MAX_CHECK_OUTPUT_BYTES: usize = 8 * 1024;
+///
+/// 32 KiB, not 8: a failing `cargo` step ends with its own failing-command echo, which for a
+/// crate with a large dependency set is ~8 KiB *on one line* — at the old 8 KiB cap that echo
+/// was the entire tail and the compiler's diagnostics were dropped (measured 2026-11-19: a
+/// SIGKILL of `agent-api` arrived as `output_tail` containing nothing but the rustc argv).
+pub const MAX_CHECK_OUTPUT_BYTES: usize = 32 * 1024;
 
 /// The largest result line this process will write. The worker reads the Pod log with a 256 KiB
 /// cap, and a result line cut in half is a line the worker cannot read — which must never be
@@ -194,7 +199,7 @@ pub fn emit(result: &RunnerResult) -> bool {
 /// Serialise the result inside [`RESULT_LINE_BUDGET`].
 ///
 /// A multi-source job runs a plan per source, so a job that fails everywhere can carry dozens of
-/// 8 KiB tails. The worker reads at most 256 KiB of log and keeps the END; a line larger than
+/// [`MAX_CHECK_OUTPUT_BYTES`]-sized tails. The worker reads at most 256 KiB of log and keeps the END; a line larger than
 /// that is cut at its head and can no longer be parsed, which the worker must never read as a
 /// pass. So the producer bounds its own line: output tails are replaced by a marker, newest
 /// first, until the line fits. Checks, names and the verdict always survive.
