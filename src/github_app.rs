@@ -126,6 +126,12 @@ impl GitHubApp {
         }
     }
 
+    /// The API base this App talks to (github.com, or a test stub).
+    #[must_use]
+    pub fn api_base(&self) -> &str {
+        &self.api_base
+    }
+
     /// An installation token, reusing the cached one until shortly before it expires.
     ///
     /// # Errors

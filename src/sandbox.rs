@@ -1125,10 +1125,20 @@ impl Sandbox {
 /// (measured 2026-11-19 on `agent`: four rustc jobs over a 4 GiB limit). The runner bounds that
 /// coupling itself with `CARGO_BUILD_JOBS` — see `runner::exec::run_child`. Raise both together or
 /// neither.
+///
+/// ⚠️ 6 GiB, not 4, because a single compile need not fit 4: measured 2026-11-19, one `clippy`
+/// process on `agent-api` peaked at **3.9 GiB RSS**, leaving nothing of a 4 GiB Pod for cargo,
+/// sccache and the OS — the kernel killed it with `SIGKILL` even with two compile jobs.
+///
+/// ⚠️ Not 8 either: the kata VM itself cannot take it. Measured the same day with a trivial probe
+/// Pod (`grep MemTotal /proc/meminfo`, no compiler): an 8 GiB limit is OOM-killed at VM start on
+/// worker3, while 6 GiB boots with `MemTotal` 6,457,056 kB. The guest also reports 8 CPUs whatever
+/// the CPU limit, which is why `CARGO_BUILD_JOBS` — not the cgroup — is what bounds parallelism.
+/// The `coding-runs` `ResourceQuota` (`limits.memory: 64Gi`) then admits eight of these.
 #[must_use]
 pub fn resources_for(kind: JobKind) -> Value {
     let (request_cpu, request_memory, limit_cpu, limit_memory) = match kind {
-        JobKind::Test | JobKind::Build | JobKind::Lint | JobKind::Check => ("1", "2Gi", "4", "4Gi"),
+        JobKind::Test | JobKind::Build | JobKind::Lint | JobKind::Check => ("1", "2Gi", "4", "6Gi"),
         _ => ("500m", "1Gi", "1", "2Gi"),
     };
     json!({

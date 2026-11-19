@@ -1380,14 +1380,14 @@ async fn run_child(
         .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_TARGET_DIR", ctx.target_dir)
         .env("GIT_TERMINAL_PROMPT", "0")
-        // A job Pod is 4 CPUs over a 4 GiB limit (`sandbox::resources_for`). Cargo derives its
-        // job count from the cgroup's CPU quota, so a 4-core limit runs four rustc processes at
-        // once — and a heavy workspace bursts past the memory limit: measured 2026-11-19 on
-        // `agent`, agent-api's lib and lib-test together were SIGKILLed by the kernel
-        // (`sccache: Compile terminated by signal 9`) on every job while every other crate came
-        // from sccache (886 hits, 0 misses). Two compile jobs is the parallelism that fitted the
-        // same 4 GiB before the CPU limit was raised.
-        .env("CARGO_BUILD_JOBS", "2")
+        // ONE compile job at a time. The sandbox is a kata VM whose usable memory is ~6 GiB
+        // whatever the Pod declares (`sandbox::resources_for`), and the guest reports 8 CPUs to
+        // cargo regardless of the CPU limit — so without this cargo would run eight rustc
+        // processes. Measured 2026-11-19 on `agent`: the heaviest crate needs most of the VM by
+        // itself (`sccache: Compile terminated by signal 9` even with two jobs), while every
+        // other crate comes from sccache (886 hits, 0 misses). Serialising costs wall time on a
+        // warm cache and buys the verdict.
+        .env("CARGO_BUILD_JOBS", "1")
         // CI's rust job sets this; without it every dev-profile artifact carries DWARF, which is
         // what makes a target directory multi-gigabyte. The gate exists to reproduce CI's
         // verdict, so it builds the way CI builds.
