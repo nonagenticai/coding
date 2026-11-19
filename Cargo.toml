@@ -4,7 +4,7 @@ name = "coding"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "Rust service created from nonagenticai/template-rust-service"
+description = "Sandboxed code-check service: queues jobs over HTTP and runs each in an isolated kata Pod"
 license = "Apache-2.0"
 
 [lib]
@@ -113,3 +113,12 @@ debug = 1
 # (`cargo update -p sqlx-sqlite`), and confirm `cargo audit` still passes.
 [patch.crates-io]
 sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "987b8c5a74b6da8b71da6b5549925a7f6e59aac9" }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ⛔ THE QUALITY BAR (2026-11-19). `clippy::pedantic` is denied for the whole
+# crate, not just the default `cargo clippy -D warnings` set. The crate is at
+# zero findings; an exception belongs on the specific item with a `// reason:`
+# line — never as a crate-wide allow here, and never as a bare allow with no
+# reason.
+[lints.clippy]
+pedantic = "deny"
