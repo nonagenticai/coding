@@ -1,0 +1,62 @@
+# The coding gate, reusable: a public Rust repository's CI runs the app's plan on its HEAD.
+#
+# It lives beside the client it builds, so a caller pins ONE commit and gets both halves.
+# The licence token is an Actions secret; a fork PR never receives it, so the job is skipped
+# there — a recorded reason, not a silent pass.
+name: gate
+
+on:
+  workflow_call:
+    inputs:
+      client_ref:
+        description: The nonagenticai/coding commit the client is built from
+        required: true
+        type: string
+      kind:
+        description: The coding job kind to run (check = fmt + clippy + test)
+        required: false
+        type: string
+        default: check
+    secrets:
+      CODING_GATE_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/cache@v6
+        with:
+          # Registry only, as the app's own CI caches it: the client's build is minutes, not tens.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: coding-client-${{ runner.os }}-${{ inputs.client_ref }}
+          restore-keys: coding-client-${{ runner.os }}-
+
+      - name: build the coding client at the pinned commit
+        # From the public repository, not crates.io: the crate is `publish = false`, so the
+        # client is installed from the same commit the service is built from.
+        run: |
+          set -euo pipefail
+          cargo install --git https://github.com/nonagenticai/coding --locked --bin coding \
+            --rev "${{ inputs.client_ref }}" --root "$RUNNER_TEMP/coding"
+
+      - name: coding gate on this repository's HEAD
+        env:
+          CODING_TOKEN: ${{ secrets.CODING_GATE_TOKEN }}
+          CODING_GATE_STRICT: "1"
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/coding/bin/coding" check --kind "${{ inputs.kind }}" --snapshot head \
+            --url https://api.nonagentic.ai/coding
