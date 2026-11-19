@@ -75,7 +75,7 @@ The tree decides the toolchain; there is no language-specific job kind.
 
 | profile | detected by | the `check` plan |
 |---|---|---|
-| `rust` | `Cargo.toml` + `Cargo.lock` | `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test --locked` |
+| `rust` | `Cargo.toml` + `Cargo.lock` | `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`, `cargo test --locked` |
 | `python` | `pyproject.toml` + `uv.lock` | `uv lock --check`, `uv sync --all-extras --locked`, `ruff check`, `ruff format --check`, `ty check src`, `pytest -v --tb=short` |
 
 `--profile auto` (the default) detects the profile from the packed tree; a repository carrying

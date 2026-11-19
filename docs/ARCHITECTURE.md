@@ -40,8 +40,9 @@ State is always readable at `GET /api/jobs/{id}`, `GET /api/jobs/status`, and th
 
 Plans are compiled-in tables (`src/runner/mod.rs`), never a shell string:
 
-- rust: `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo build`,
-  `cargo test`.
+- rust: `cargo fmt --check`, `cargo clippy --all-targets --locked -- -D warnings`,
+  `cargo build --locked`, `cargo test --locked` — every cargo step except `fmt` passes
+  `--locked`, as the reference CI does, so a stale lock fails the gate exactly where CI fails.
 - python: `uv lock --check`/`uv sync`, `ruff check`, `ruff format --check`, `ty` (scoped to
   `src`, like the estate's CI), `pytest`.
 

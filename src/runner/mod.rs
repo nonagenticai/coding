@@ -123,7 +123,18 @@ const RUST_LINT: &[Planned] = &[
     Planned {
         name: "cargo clippy",
         program: "cargo",
-        args: &["clippy", "--all-targets", "--", "-D", "warnings"],
+        // `--locked`, exactly as every reference CI runs it (agent `ci-public.yml:136`,
+        // care-bus `:115`): without it clippy silently updates a stale `Cargo.lock` in the Pod
+        // and the gate passes a commit CI refuses. Measured 2026-11-19 — this was the only
+        // clippy step in the crate missing the flag.
+        args: &[
+            "clippy",
+            "--all-targets",
+            "--locked",
+            "--",
+            "-D",
+            "warnings",
+        ],
         needs_database: false,
         needs_redis: false,
     },
@@ -421,6 +432,25 @@ mod tests {
                     assert_ne!(step.program, "bash");
                     assert!(!step.args.contains(&"-c"));
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn every_cargo_plan_refuses_a_stale_lock() {
+        // Every reference CI runs clippy/test with `--locked`; the gate must give the same
+        // verdict, or it passes a commit CI will refuse. `cargo fmt` takes no such flag and is
+        // the one step exempt on purpose.
+        for kind in [JobKind::Test, JobKind::Lint, JobKind::Build, JobKind::Check] {
+            for step in plan(Profile::Rust, kind).expect("a Rust plan") {
+                if step.name == "cargo fmt" {
+                    continue;
+                }
+                assert!(
+                    step.args.contains(&"--locked"),
+                    "{kind:?}: {} must pass --locked",
+                    step.name
+                );
             }
         }
     }
