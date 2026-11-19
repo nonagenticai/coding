@@ -6,6 +6,7 @@
 pub mod client;
 pub mod config;
 pub mod db;
+pub mod deliver;
 pub mod domain;
 pub mod error;
 pub mod github_app;

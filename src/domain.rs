@@ -234,6 +234,125 @@ pub struct JobInput {
     /// before this field existed denies unknown fields, so a single-source job must not carry it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<NamedSource>,
+    /// The delivery target for `github_op`: the job's `source` (an upload) is a bounded tree the
+    /// WORKER turns into a branch and a pull request. No Pod is spawned for that kind, so the
+    /// App's installation token never reaches untrusted code. Only `github_op` may set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<OutputSpec>,
+}
+
+/// Where a `github_op` delivery writes. Bounds are enforced before a row exists, because the
+/// worker performs this with the App's write token: a caller must not be able to choose an
+/// arbitrary host, ref or unbounded text.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OutputSpec {
+    /// The target repository, `owner/name` on github.com.
+    pub repo: String,
+    /// The branch the PR is based on; default `main`.
+    #[serde(default = "default_base")]
+    pub base: String,
+    /// The created branch is `<prefix>/<job id>`; default `coding/deliver`.
+    #[serde(default = "default_branch_prefix")]
+    pub branch_prefix: String,
+    /// The PR title; required and bounded.
+    pub title: String,
+    /// The PR body; default empty, bounded.
+    #[serde(default)]
+    pub body: String,
+}
+
+fn default_base() -> String {
+    "main".to_owned()
+}
+
+fn default_branch_prefix() -> String {
+    "coding/deliver".to_owned()
+}
+
+/// The caps [`validate_output`] enforces. GitHub's own limits are larger; these bound what a
+/// single job may ask the worker to write.
+const MAX_OUTPUT_REPO_BYTES: usize = 140;
+const MAX_OUTPUT_REF_BYTES: usize = 200;
+const MAX_OUTPUT_TITLE_BYTES: usize = 200;
+const MAX_OUTPUT_BODY_BYTES: usize = 60_000;
+
+/// Why an [`OutputSpec`] was refused.
+fn validate_output(output: &OutputSpec) -> Result<(), InputError> {
+    validate_output_repo(&output.repo)?;
+    validate_output_ref("output.base", &output.base)?;
+    validate_output_ref("output.branch_prefix", &output.branch_prefix)?;
+    if output.branch_prefix.ends_with('/') {
+        return Err(InputError::new(
+            "output.branch_prefix must not end with '/'",
+        ));
+    }
+    let title = output.title.trim();
+    if title.is_empty() || title.len() > MAX_OUTPUT_TITLE_BYTES {
+        return Err(InputError::new(format!(
+            "output.title must be 1..={MAX_OUTPUT_TITLE_BYTES} bytes after trimming"
+        )));
+    }
+    if output.body.len() > MAX_OUTPUT_BODY_BYTES {
+        return Err(InputError::new(format!(
+            "output.body is {} bytes, over the {MAX_OUTPUT_BODY_BYTES}-byte cap",
+            output.body.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_output_repo(repo: &str) -> Result<(), InputError> {
+    let mut parts = repo.split('/');
+    let (Some(owner), Some(name), None) = (parts.next(), parts.next(), parts.next()) else {
+        return Err(InputError::new("output.repo must be exactly `owner/name`"));
+    };
+    if repo.len() > MAX_OUTPUT_REPO_BYTES || repo.contains("..") {
+        return Err(InputError::new("output.repo is malformed"));
+    }
+    // GitHub *logins* are alphanumeric + hyphen, 1..=39, and may not begin or end with a
+    // hyphen (no dots or underscores). Repository names additionally allow `.` and `_` — and a
+    // name like `.github` is legitimate, so a leading dot is allowed on the NAME only.
+    let owner_ok = !owner.is_empty()
+        && owner.len() <= 39
+        && owner
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && !owner.starts_with('-')
+        && !owner.ends_with('-');
+    let name_ok = !name.is_empty()
+        && name.len() <= 100
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        && name != "."
+        && name != "..";
+    if !owner_ok || !name_ok {
+        return Err(InputError::new(
+            "output.repo must be `owner/name`: the owner is a GitHub login (1..=39 alphanumeric/\
+             hyphen, no leading or trailing hyphen) and the name is 1..=100 of [A-Za-z0-9._-]",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_output_ref(field: &str, value: &str) -> Result<(), InputError> {
+    let valid = !value.is_empty()
+        && value.len() <= MAX_OUTPUT_REF_BYTES
+        && !value.starts_with('/')
+        && !value.ends_with('/')
+        && !value.contains("..")
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'));
+    if !valid {
+        return Err(InputError::new(format!(
+            "{field} must be a git ref: 1..={MAX_OUTPUT_REF_BYTES} characters of [A-Za-z0-9._/-], \
+             no leading '-' or '/', no trailing '/', no '..'"
+        )));
+    }
+    Ok(())
 }
 
 /// One source of a multi-source job: the name it is materialised under and the profile its plan
@@ -333,6 +452,37 @@ impl JobInput {
     /// `InputError` naming the first violated rule: a source missing for a code-running kind,
     /// or a source field that is malformed, out of range or not allowed for its variant.
     pub fn validate(&self, kind: JobKind) -> Result<(), InputError> {
+        // The delivery target is checked BEFORE the whole-input JSON cap: a bounded field must
+        // report its own cap, not the generic serialisation one (a 60 KB body is over the body
+        // cap and also over the input cap; the body message is the actionable one).
+        if kind == JobKind::GithubOp {
+            let Some(output) = &self.output else {
+                return Err(InputError::new(
+                    "kind github_op requires input.output {repo, title}: there is nothing to \
+                     deliver without it",
+                ));
+            };
+            validate_output(output)?;
+            match &self.source {
+                Some(Source::Upload { .. }) => {}
+                Some(_) => {
+                    return Err(InputError::new(
+                        "kind github_op delivers a bounded UPLOAD: input.source must be \
+                         {\"kind\": \"upload\", \"id\": …}",
+                    ));
+                }
+                None => {
+                    return Err(InputError::new(
+                        "kind github_op requires input.source (an upload) — the output tree",
+                    ));
+                }
+            }
+        } else if self.output.is_some() {
+            return Err(InputError::new(format!(
+                "kind {} must not set input.output; only github_op delivers",
+                kind.as_str()
+            )));
+        }
         self.validate_shape()?;
         if self.source.is_none() && self.sources.is_empty() && needs_source(kind) {
             return Err(InputError::new(format!(
@@ -704,6 +854,7 @@ mod tests {
     fn inline(files: &[(&str, &str)]) -> JobInput {
         JobInput {
             profile: Profile::Rust,
+            output: None,
             sources: Vec::new(),
             source: Some(Source::Inline {
                 files: files
@@ -720,6 +871,7 @@ mod tests {
     fn git(url: &str, git_ref: &str) -> JobInput {
         JobInput {
             profile: Profile::Rust,
+            output: None,
             sources: Vec::new(),
             source: Some(Source::Git {
                 url: url.to_owned(),
@@ -770,7 +922,6 @@ mod tests {
         for kind in [
             JobKind::Analyze,
             JobKind::Scan,
-            JobKind::GithubOp,
             JobKind::DependencyUpgrade,
             JobKind::CrateMap,
             JobKind::ParityOpenapi,
@@ -780,6 +931,8 @@ mod tests {
         ] {
             assert!(JobInput::default().validate(kind).is_ok(), "{kind:?}");
         }
+        // `github_op` is no longer a no-op placeholder: it needs an output spec and an upload.
+        assert!(JobInput::default().validate(JobKind::GithubOp).is_err());
     }
 
     #[test]
@@ -915,6 +1068,7 @@ mod tests {
         for depth in [0u32, 1001] {
             let input = JobInput {
                 profile: Profile::Rust,
+                output: None,
                 sources: Vec::new(),
                 source: Some(Source::Git {
                     url: "https://host/repo".to_owned(),
@@ -932,6 +1086,7 @@ mod tests {
     fn upload(id: &str) -> JobInput {
         JobInput {
             profile: Profile::Rust,
+            output: None,
             sources: Vec::new(),
             source: Some(Source::Upload {
                 id: id.to_owned(),
@@ -940,6 +1095,135 @@ mod tests {
                 sha256: None,
             }),
         }
+    }
+
+    fn output(repo: &str) -> OutputSpec {
+        OutputSpec {
+            repo: repo.to_owned(),
+            base: "main".to_owned(),
+            branch_prefix: "coding/deliver".to_owned(),
+            title: "deliver the tree".to_owned(),
+            body: String::new(),
+        }
+    }
+
+    fn deliver(output_spec: Option<OutputSpec>, source: Option<Source>) -> JobInput {
+        JobInput {
+            profile: Profile::Rust,
+            output: output_spec,
+            source,
+            sources: Vec::new(),
+        }
+    }
+
+    fn upload_source() -> Source {
+        Source::Upload {
+            id: "00000000-0000-0000-0000-000000000001".to_owned(),
+            url: None,
+            token: None,
+            sha256: None,
+        }
+    }
+
+    #[test]
+    fn github_op_requires_an_upload_and_an_output() {
+        let ok = deliver(Some(output("nonagenticai/fixture")), Some(upload_source()));
+        assert!(ok.validate(JobKind::GithubOp).is_ok());
+
+        let no_output = deliver(None, Some(upload_source()));
+        let error = reject(&no_output, JobKind::GithubOp);
+        assert!(error.message.contains("input.output"), "{}", error.message);
+
+        let no_source = deliver(Some(output("nonagenticai/fixture")), None);
+        let error = reject(&no_source, JobKind::GithubOp);
+        assert!(error.message.contains("input.source"), "{}", error.message);
+
+        for source in [
+            Source::Git {
+                url: "https://github.com/o/r".to_owned(),
+                git_ref: "main".to_owned(),
+                depth: 1,
+                token: None,
+            },
+            Source::Inline {
+                files: vec![InlineFile {
+                    path: "a.rs".to_owned(),
+                    text: "x".to_owned(),
+                }],
+            },
+        ] {
+            let input = deliver(Some(output("nonagenticai/fixture")), Some(source));
+            let error = reject(&input, JobKind::GithubOp);
+            assert!(error.message.contains("UPLOAD"), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn output_is_refused_on_every_other_kind() {
+        let input = deliver(Some(output("nonagenticai/fixture")), Some(upload_source()));
+        let error = reject(&input, JobKind::Check);
+        assert!(
+            error.message.contains("only github_op"),
+            "{}",
+            error.message
+        );
+    }
+
+    #[test]
+    fn the_output_repo_refs_title_and_body_are_bounded() {
+        for repo in ["owner", "a/b/c", "a b/c", "a/..", ".x/y", ""] {
+            let input = deliver(Some(output(repo)), Some(upload_source()));
+            let error = reject(&input, JobKind::GithubOp);
+            assert!(
+                error.message.contains("output.repo"),
+                "{repo}: {}",
+                error.message
+            );
+        }
+        for base in ["", "/main", "main/", "main..x", "-main", "main x"] {
+            let mut spec = output("nonagenticai/fixture");
+            spec.base = base.to_owned();
+            let input = deliver(Some(spec), Some(upload_source()));
+            let error = reject(&input, JobKind::GithubOp);
+            assert!(
+                error.message.contains("output.base"),
+                "{base}: {}",
+                error.message
+            );
+        }
+        let mut spec = output("nonagenticai/fixture");
+        spec.branch_prefix = "coding/deliver/".to_owned();
+        let error = reject(
+            &deliver(Some(spec), Some(upload_source())),
+            JobKind::GithubOp,
+        );
+        assert!(
+            error.message.contains("output.branch_prefix"),
+            "{}",
+            error.message
+        );
+
+        let mut spec = output("nonagenticai/fixture");
+        spec.title = " ".to_owned();
+        let error = reject(
+            &deliver(Some(spec), Some(upload_source())),
+            JobKind::GithubOp,
+        );
+        assert!(error.message.contains("output.title"), "{}", error.message);
+        let mut spec = output("nonagenticai/fixture");
+        spec.title = "t".repeat(MAX_OUTPUT_TITLE_BYTES + 1);
+        let error = reject(
+            &deliver(Some(spec), Some(upload_source())),
+            JobKind::GithubOp,
+        );
+        assert!(error.message.contains("output.title"), "{}", error.message);
+        let mut spec = output("nonagenticai/fixture");
+        spec.body = "b".repeat(MAX_OUTPUT_BODY_BYTES + 1);
+        let error = reject(
+            &deliver(Some(spec), Some(upload_source())),
+            JobKind::GithubOp,
+        );
+        assert!(error.message.contains("output.body"), "{}", error.message);
     }
 
     #[test]
@@ -972,6 +1256,7 @@ mod tests {
     fn a_client_cannot_supply_a_git_token() {
         let input = JobInput {
             profile: Profile::Rust,
+            output: None,
             sources: Vec::new(),
             source: Some(Source::Git {
                 url: "https://github.com/o/r".to_owned(),
@@ -1044,6 +1329,7 @@ mod tests {
     fn sources(list: Vec<NamedSource>) -> JobInput {
         JobInput {
             profile: Profile::Rust,
+            output: None,
             source: None,
             sources: list,
         }
