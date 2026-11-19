@@ -37,6 +37,9 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+# The build stamp (build.rs). There is no `.git` in this context, so it reports `unknown` --
+# which is the honest answer, and keeps the manifest identical to the one cargo reads elsewhere.
+COPY build.rs ./
 COPY src ./src
 COPY migrations ./migrations
 # Only the runner binary is built: the image carries no control-plane code paths.
