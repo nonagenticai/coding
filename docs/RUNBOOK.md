@@ -28,6 +28,7 @@ the flag against an old digest is refused at job create (`sandbox_not_configured
 | `CODING_RUNNER_PROFILES` | worker | e.g. `rust,python` |
 | `CODING_RUNNER_MULTI_SOURCE` | worker | `1` enables `input.sources` |
 | `CODING_KATA_RUNTIME_CLASS` | worker | `coding-kata` |
+| `CODING_KATA_RUNTIME_CLASS_LARGE` | worker | RuntimeClass for `build`/`test`/`check`, whose VM boots at the compile tier's memory (`coding-kata-large`). Unset → falls back to `CODING_KATA_RUNTIME_CLASS` |
 | `CODING_RUNS_PULL_SECRET` | worker | image pull secret name, when the registry needs one |
 | `CODING_GITHUB_APP_ID`, `CODING_GITHUB_APP_INSTALLATION_ID`, `CODING_GITHUB_APP_PRIVATE_KEY_PATH` | worker | App identity for private clones |
 | `CODING_GITHUB_API_BASE` | worker | optional; GitHub Enterprise API base |

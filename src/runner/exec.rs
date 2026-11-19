@@ -1380,13 +1380,14 @@ async fn run_child(
         .env("CARGO_TERM_COLOR", "never")
         .env("CARGO_TARGET_DIR", ctx.target_dir)
         .env("GIT_TERMINAL_PROMPT", "0")
-        // ONE compile job at a time. The sandbox is a kata VM whose usable memory is ~6 GiB
-        // whatever the Pod declares (`sandbox::resources_for`), and the guest reports 8 CPUs to
-        // cargo regardless of the CPU limit — so without this cargo would run eight rustc
-        // processes. Measured 2026-11-19 on `agent`: the heaviest crate needs most of the VM by
-        // itself (`sccache: Compile terminated by signal 9` even with two jobs), while every
-        // other crate comes from sccache (886 hits, 0 misses). Serialising costs wall time on a
-        // warm cache and buys the verdict.
+        // ONE compile job at a time. The guest reports 8 CPUs to cargo regardless of the CPU
+        // limit — so without this cargo would run eight rustc processes. Measured 2026-11-19 on
+        // `agent`: the heaviest crate needs most of the VM by itself (`sccache: Compile
+        // terminated by signal 9` even with two jobs), while every other crate comes from sccache
+        // (886 hits, 0 misses). Serialising costs wall time on a warm cache and buys the verdict.
+        // The VM's memory comes from the Pod's RuntimeClass (`sandbox::resources_for`): compile
+        // kinds get the large kata profile, which boots the VM at its size instead of relying on
+        // hot-plug.
         .env("CARGO_BUILD_JOBS", "1")
         // CI's rust job sets this; without it every dev-profile artifact carries DWARF, which is
         // what makes a target directory multi-gigabyte. The gate exists to reproduce CI's
