@@ -23,12 +23,12 @@ coding hook install                                     # pre-push gate
 coding hook install --hook pre-commit --kind lint       # committed fast gate, if you want one
 git config coding.url http://127.0.0.1:8687             # what the hook reads
 
-# Behind the licence-gated gateway (coding.nonagentic.ai/coding) every request carries
+# Behind the licence-gated gateway (api.nonagentic.ai/coding) every request carries
 # `Authorization: Bearer <token>`. The token comes from --token, CODING_TOKEN, then
 # `git config coding.token` — in that order. It is never printed and the hooks never pass
 # it on a command line.
 git config coding.token "$CODING_TOKEN"
-CODING_URL=https://coding.nonagentic.ai/coding coding check
+CODING_URL=https://api.nonagentic.ai/coding coding check
 ```
 
 What it sends: a gzip tar of `git ls-files` plus untracked-not-ignored files, read from the
