@@ -86,8 +86,19 @@ runner image carries sccache; the worker switches it on when `CODING_SCCACHE_BUC
 
 ## Local gate (before a push)
 
-This repository's gate needs PostgreSQL 18 + Redis for the DB-backed tests, so `rbuild --gate`
-(archetype defaults, no services) is **not** the gate here. On m1:
+`rbuild --gate` mirrors this repository's own `.github/workflows/ci-public.yml`: fmt, clippy,
+nextest, doctests and `cargo audit`, with a throwaway PostgreSQL 18 + Redis on m1 (the gate
+asserts the host's majors match the workflow's `PG_IMAGE` / `REDIS_IMAGE`). Use it:
+
+```bash
+rbuild --gate
+```
+
+A workflow step rbuild cannot mirror (a CI-only tool or fixture install) fails the gate with the
+step named; `RBUILD_GATE_SKIP_UNMIRRORED=<substring[,substring]>` is the explicit escape. The
+public workflow's own command is the test guard — there is no `require_tests` input to apply.
+
+The per-step form still works when you want one stage:
 
 ```bash
 ALLOW_LOCAL_RUST=1 cargo fmt --all -- --check      # format locally; rbuild -- fmt would format m1's copy
