@@ -55,6 +55,30 @@ Kustomization's `lastAppliedRevision` names a commit your merge is an ancestor o
 2. `kubectl -n coding-runs get pods` — one Pod per running job; `kubectl -n coding-runs logs -f <pod>`.
 3. The Pod's last line is the result. Missing result + exit 0 = `runner_failed` (a bug, not a pass).
 
+### Run a parity job by hand
+
+Two private fixtures carry a root `openapi.json` (`conveyor-coding/py2rs-fixture-svc` and its Rust
+port `py2rs-fixture-svc-rs`), so a real comparison needs no upload:
+
+```bash
+curl -sS -X POST "$CODING_URL/api/jobs" -H "Authorization: Bearer $CODING_TOKEN" \
+  -H 'Content-Type: application/json' -d '{
+  "kind": "parity_openapi",
+  "timeout_seconds": 300,
+  "input": {
+    "sources": [
+      {"name": "target",   "profile": "rust",   "source": {"kind": "git", "url": "https://github.com/conveyor-coding/py2rs-fixture-svc-rs", "ref": "main"}},
+      {"name": "source-1", "profile": "python", "source": {"kind": "git", "url": "https://github.com/conveyor-coding/py2rs-fixture-svc",    "ref": "main"}}
+    ],
+    "parity": {"target": "target", "routes": [{"method": "GET", "path": "/api/jobs"}]}
+  }}'
+```
+
+Poll `POST /api/jobs/status` with `{"id": "…"}`; the result's `parity.counts` and
+`parity.routes[].differences` are the computed answer, and `checks[]` carries the verdict. Omit
+`parity.routes` for the union form. A `parity.error` on a route is a named document problem (an
+external `$ref`, a malformed node), not infrastructure.
+
 ### Failure classes
 
 | signal | meaning |

@@ -14,7 +14,7 @@ use tokio::process::Command;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::Instant as TokioInstant;
 
-use crate::domain::{Profile, Source};
+use crate::domain::{JobKind, Profile, Source};
 use crate::runner::plan;
 use crate::runner::postgres;
 use crate::runner::redis;
@@ -56,6 +56,19 @@ impl Cancellation {
         Ok(Self {
             signal: signal(SignalKind::terminate())?,
         })
+    }
+
+    /// Whether SIGTERM has already arrived, without awaiting one. The in-process parity step has
+    /// no child to select on, so it polls this between documents and routes instead.
+    ///
+    /// A single poll of the signal stream: `biased` makes the signal the first branch, and an
+    /// always-ready `ready(())` second means the call never waits.
+    pub async fn received(&mut self) -> bool {
+        tokio::select! {
+            biased;
+            _ = self.signal.recv() => true,
+            () = std::future::ready(()) => false,
+        }
     }
 }
 
@@ -156,8 +169,10 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
     let units = units(spec, work_dir);
     // Every unit must have a plan before anything is cloned or started: a job that would check
     // two sources and cannot check one of them is answered before it burns a clone or a database.
+    // `parity_openapi` is the exception by design: it has no command plan (nothing is executed),
+    // and its branch below reads the documents from the materialised trees instead.
     for unit in &units {
-        if plan(unit.profile, spec.kind).is_none() {
+        if spec.kind != JobKind::ParityOpenapi && plan(unit.profile, spec.kind).is_none() {
             return RunnerResult::new(
                 Status::Unsupported,
                 match unit.name {
@@ -236,6 +251,17 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
         }
     }
     attach_sources(&mut result, multi, &mut infos);
+
+    // `parity_openapi` binds two or more materialised trees and compares their OpenAPI documents
+    // in-process: no command plan, no database, no Redis. Its marker is the document itself, so
+    // it runs before the profile-marker check below — that check exists for kinds that build.
+    if spec.kind == JobKind::ParityOpenapi {
+        let pairs: Vec<(String, PathBuf)> = units
+            .iter()
+            .map(|unit| (unit.name.unwrap_or("src").to_owned(), unit.dir.clone()))
+            .collect();
+        return crate::parity::execute(&spec.input, &pairs, deadline, cancel, result).await;
+    }
 
     // Each source's profile is the caller's claim about that tree. A tree without the profile's
     // marker is a mismatch, not a failing check: running cargo in a Python tree (or uv in a Rust

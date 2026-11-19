@@ -28,7 +28,8 @@ State is always readable at `GET /api/jobs/{id}`, `GET /api/jobs/status`, and th
 
 ## Contracts
 
-- `JobKind`: `test`, `lint`, `build`, `check`, `analyze`, `scan`.
+- `JobKind`: `test`, `lint`, `build`, `check`, `github_op` (worker-side delivery, no Pod), and
+  `parity_openapi` (in-Pod document comparison); the remaining kinds are declared placeholders.
 - `JobInput`: exactly one of `source` (single) or `sources` (1–8 named sources, each with its own
   `profile`); both together or neither is a 422 `invalid_job_input`.
 - `Source`: `inline` (paths + content, 48 KiB summed), `git` (url, ref, depth), `upload`
@@ -52,13 +53,20 @@ A source that does not carry the marker its profile needs (`Cargo.toml` / `pypro
 `unsupported` (exit 2) for the whole job before any step runs — never a misleading failing check.
 A service that will not start or dies mid-step is exit 3, not a verdict about the code.
 
+`parity_openapi` has no command plan: after the trees materialise, `src/parity.rs` reads each
+source's root `openapi.json` and compares them in-process, bounded by document size, `$ref` depth
+and a capped report. It runs inside the Pod on purpose — the documents are untrusted input, and
+the Pod is where untrusted input is parsed. Its marker is the document itself, not a build file.
+
 ## Sandbox
 
-`src/sandbox.rs` builds the Pod: `runtimeClassName: coding-kata`, read-only root, one 8 GiB
-`emptyDir` at `/tmp`, 1 CPU request / 2 limit, the pinned `CODING_RUNNER_IMAGE`, and only
-`CODING_JOB_SPEC` in the environment. Profile and multi-source capability are refused **before a
-Pod exists** when the pinned runner image predates them
-(`CODING_RUNNER_PROFILES`, `CODING_RUNNER_MULTI_SOURCE`).
+`src/sandbox.rs` builds the Pod: read-only root, one 8 GiB `emptyDir` at `/tmp`, the pinned
+`CODING_RUNNER_IMAGE`, and only `CODING_JOB_SPEC` in the environment. Resources follow the kind:
+`build`/`test`/`check` request 1 CPU / 2 GiB and limit 4 CPU / 10 GiB on the large kata profile
+(its VM must *boot* with the memory — above ~6 GiB it is never hot-plugged); `lint` limits 4 CPU /
+6 GiB; everything else 500m / 1 CPU / 2 GiB. Profile and multi-source capability are refused
+**before a Pod exists** when the pinned runner image predates them (`CODING_RUNNER_PROFILES`,
+`CODING_RUNNER_MULTI_SOURCE`).
 
 ## Store and tenancy
 
@@ -83,6 +91,8 @@ used by the client when none is configured. Every store query is tenant-scoped.
 | `worker.rs` | claim → prepare → create → reap → record; concurrency, lease, reapers |
 | `sandbox.rs` | the job Pod: manifest, create/reattach, state, logs, delete |
 | `runner/` | the in-Pod executor: materialise, plans, throwaway PG/Redis, result |
+| `parity.rs` | the in-Pod `OpenAPI` diff for `parity_openapi` (slice and union forms) |
+| `deliver.rs` | the worker-side `github_op` delivery (branch + PR, no Pod) |
 | `source_archive.rs` | the gzip-tar packer and the hostile-input validator |
 | `client/` | `coding check` and the generated git hooks |
 | `github_app.rs` | App JWT → installation token for github.com clones |
