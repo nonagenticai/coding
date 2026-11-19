@@ -331,10 +331,15 @@ fn manifest_is_restricted_and_carries_the_spec() {
     // quota, so 2 ran at most ~2 rustc jobs on any node. It is raised without raising the
     // request, because `requests.cpu` is quota-capped at 8 in `coding-runs` (8 concurrent jobs)
     // while `limits.cpu` is not capped at all. The LimitRange ceiling there is 6 CPU.
+    //
+    // Memory is 8Gi because one compile alone can need it: a single `clippy` on the heaviest
+    // workspace peaked at 3.9 GiB RSS (2026-11-19), which cannot fit a 4 GiB Pod once cargo,
+    // sccache and the OS are counted. The namespace quota's `limits.memory` (64Gi) is the real
+    // concurrency ceiling at this size.
     assert_eq!(container["resources"]["requests"]["cpu"], "1");
     assert_eq!(container["resources"]["requests"]["memory"], "2Gi");
     assert_eq!(container["resources"]["limits"]["cpu"], "4");
-    assert_eq!(container["resources"]["limits"]["memory"], "4Gi");
+    assert_eq!(container["resources"]["limits"]["memory"], "8Gi");
 
     let analyze = sandbox
         .pod_manifest("job-2", "tenant-a", JobKind::Analyze, &json!({}))
