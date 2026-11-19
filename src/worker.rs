@@ -495,7 +495,8 @@ fn sandbox_job_error(error: &SandboxError) -> JobError {
         | SandboxError::Invalid { .. }
         | SandboxError::Credential(_)
         | SandboxError::ProfileNotEnabled { .. }
-        | SandboxError::SourcesNotEnabled => ("sandbox_not_configured", false),
+        | SandboxError::SourcesNotEnabled
+        | SandboxError::TestRunnerNotEnabled => ("sandbox_not_configured", false),
         SandboxError::Manifest(_) | SandboxError::SpecTooLarge { .. } => {
             ("invalid_job_spec", false)
         }

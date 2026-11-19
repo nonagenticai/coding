@@ -72,13 +72,45 @@ pub fn needs_redis(kind: JobKind) -> bool {
 /// The Rust plans: one compiled-in table per runnable kind. The pre-commit gate lists the same
 /// three checks as `lint` plus `test`, in the order that fails fastest, so a formatting problem
 /// never hides a failing test.
-const RUST_TEST: &[Planned] = &[Planned {
-    name: "cargo test",
-    program: "cargo",
-    args: &["test", "--locked"],
-    needs_database: true,
-    needs_redis: true,
-}];
+/// The Rust test plan mirrors what CI runs, and the choice of runner is not cosmetic.
+///
+/// `cargo test` executes a workspace's test binaries ONE AT A TIME. On a workspace with hundreds
+/// of integration-test files that is not a slower measurement of the same thing, it is a
+/// different order of magnitude: measured on `conveyor` (266 integration-test files, sccache
+/// fully warm at 997–1006 hits and 0–9 misses, so nothing was being compiled) plain `cargo test`
+/// took 894 s and twice exceeded the 1800 s budget, while the same suite under `nextest` takes
+/// about 170 s in CI. A timeout exits 3 and the hook FAILS OPEN, so the real cost was 30 minutes
+/// of a blocked push buying no verdict at all.
+///
+/// `cargo test --doc` stays: nextest does not run doctests, and CI runs both for the same reason.
+/// ⚠️ Order matters, and not for reporting: the throwaway `PostgreSQL`/Redis cluster is started
+/// lazily immediately before the step that needs it and dies if it sits idle, so the doctest run —
+/// which needs neither — goes FIRST and the suite that needs them is LAST. Doctests are also the
+/// faster failure, which is the ordering rule the other plans already follow.
+const RUST_TEST: &[Planned] = &[
+    Planned {
+        name: "cargo test --doc",
+        program: "cargo",
+        args: &["test", "--doc", "--locked"],
+        needs_database: false,
+        needs_redis: false,
+    },
+    Planned {
+        name: "cargo nextest",
+        program: "cargo-nextest",
+        args: &[
+            "nextest",
+            "run",
+            "--no-tests",
+            "fail",
+            "--color",
+            "never",
+            "--locked",
+        ],
+        needs_database: true,
+        needs_redis: true,
+    },
+];
 
 const RUST_LINT: &[Planned] = &[
     Planned {

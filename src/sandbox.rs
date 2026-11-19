@@ -41,6 +41,10 @@ pub const MULTI_SOURCE_ENV: &str = "CODING_RUNNER_MULTI_SOURCE";
 /// is refused before a Pod is created, so a deployment that has not been told about a profile
 /// fails with a message instead of an `invalid job spec` from an older runner.
 pub const PROFILES_ENV: &str = "CODING_RUNNER_PROFILES";
+/// `CODING_RUNNER_NEXTEST`: whether the pinned runner image carries `cargo-nextest`, which the
+/// Rust `test` plan needs. Off unless set, so a worker rolled ahead of its image refuses the job
+/// with a legible message instead of failing it on `cargo-nextest: not found`.
+pub const NEXTEST_ENV: &str = "CODING_RUNNER_NEXTEST";
 /// `CODING_KATA_RUNTIME_CLASS`: the `RuntimeClass` that puts the Pod on the kata runtime.
 pub const RUNTIME_CLASS_ENV: &str = "CODING_KATA_RUNTIME_CLASS";
 /// `CODING_RUNS_PULL_SECRET`: the imagePullSecret in the runs namespace. The runner image is
@@ -165,6 +169,12 @@ pub enum SandboxError {
          when the image does)"
     )]
     SourcesNotEnabled,
+    /// The job asks for a Rust test run and the pinned runner image has no `cargo-nextest`.
+    #[error(
+        "this worker's runner image does not carry cargo-nextest (set {NEXTEST_ENV}=1 when it \
+         does); the Rust test plan runs test binaries in parallel, as CI does"
+    )]
+    TestRunnerNotEnabled,
 }
 
 /// The compilation-cache settings carried into every runner Pod.
@@ -219,6 +229,9 @@ pub struct SandboxConfig {
     /// `CODING_RUNNER_MULTI_SOURCE` says otherwise, so a job created before the image was
     /// rolled is refused with a legible message instead of `invalid job spec` from the Pod.
     pub multi_source: bool,
+    /// Whether that image carries `cargo-nextest`. `false` unless `CODING_RUNNER_NEXTEST` says
+    /// otherwise; a Rust `test` job is then refused before a Pod exists.
+    pub nextest: bool,
     /// The `RuntimeClass` that selects the kata runtime.
     pub runtime_class: String,
     /// The API server base URL, e.g. `https://10.43.0.1:443`.
@@ -284,7 +297,8 @@ impl SandboxConfig {
         let runtime_class =
             get(RUNTIME_CLASS_ENV).unwrap_or_else(|| DEFAULT_RUNTIME_CLASS.to_owned());
         let profiles = profiles_from(get(PROFILES_ENV).as_deref())?;
-        let multi_source = multi_source_from(get(MULTI_SOURCE_ENV).as_deref());
+        let multi_source = flag_from(get(MULTI_SOURCE_ENV).as_deref());
+        let nextest = flag_from(get(NEXTEST_ENV).as_deref());
 
         let api_url = if let Some(url) = get(API_URL_ENV) {
             url
@@ -398,6 +412,7 @@ impl SandboxConfig {
             runner_image,
             profiles,
             multi_source,
+            nextest,
             runtime_class,
             api_url,
             token,
@@ -437,7 +452,7 @@ fn profiles_from(value: Option<&str>) -> Result<Vec<Profile>, SandboxError> {
 
 /// Parse `CODING_RUNNER_MULTI_SOURCE`. Only an affirmative value enables the capability; a typo
 /// leaves it off, which refuses the job instead of sending a spec the image cannot parse.
-fn multi_source_from(value: Option<&str>) -> bool {
+fn flag_from(value: Option<&str>) -> bool {
     matches!(
         value.map(str::trim),
         Some("1" | "true" | "yes" | "TRUE" | "YES")
@@ -814,6 +829,15 @@ impl Sandbox {
         // surface as an `invalid job spec` failure for a job that is perfectly well formed.
         if has_sources(spec_json) && !self.config.multi_source {
             return Err(SandboxError::SourcesNotEnabled);
+        }
+        // The Rust test plan runs `cargo-nextest`, so an image without it would fail the job on
+        // `cargo-nextest: not found` — a failure that reads like the code's. Refuse it here
+        // instead, before a Pod exists.
+        if kind == JobKind::Test
+            && profiles_of_spec(spec_json)?.contains(&Profile::Rust)
+            && !self.config.nextest
+        {
+            return Err(SandboxError::TestRunnerNotEnabled);
         }
         for profile in profiles_of_spec(spec_json)? {
             if !self.config.profiles.contains(&profile) {
@@ -1317,11 +1341,11 @@ mod tests {
 
     #[test]
     fn multi_source_is_off_unless_the_value_is_affirmative() {
-        assert!(multi_source_from(Some("1")));
-        assert!(multi_source_from(Some("true")));
-        assert!(!multi_source_from(Some("0")));
-        assert!(!multi_source_from(Some("maybe")));
-        assert!(!multi_source_from(None));
+        assert!(flag_from(Some("1")));
+        assert!(flag_from(Some("true")));
+        assert!(!flag_from(Some("0")));
+        assert!(!flag_from(Some("maybe")));
+        assert!(!flag_from(None));
     }
 
     #[test]
@@ -1359,6 +1383,21 @@ mod tests {
         {
             Err(SandboxError::SourcesNotEnabled) => {}
             other => panic!("expected SourcesNotEnabled, got {other:?}"),
+        }
+    }
+
+    /// A worker rolled ahead of its runner image would otherwise fail the job inside the Pod on
+    /// `cargo-nextest: not found`, which reads as a failure of the code under test.
+    #[tokio::test]
+    async fn a_rust_test_job_is_refused_before_any_pod_when_the_image_has_no_nextest() {
+        let sandbox = Sandbox::new(config_with(&base_pairs())).expect("client");
+        let spec = serde_json::json!({"input": {"profile": "rust"}});
+        match sandbox
+            .create_run("job-1", "tenant", JobKind::Test, &spec)
+            .await
+        {
+            Err(SandboxError::TestRunnerNotEnabled) => {}
+            other => panic!("expected TestRunnerNotEnabled, got {other:?}"),
         }
     }
 

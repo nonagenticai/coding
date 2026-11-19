@@ -146,6 +146,7 @@ fn config(api_url: &str) -> SandboxConfig {
             coding::domain::Profile::Python,
         ],
         multi_source: true,
+        nextest: true,
         runtime_class: "coding-kata".to_owned(),
         api_url: api_url.to_owned(),
         token: "test-token".to_owned(),
