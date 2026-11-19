@@ -1,8 +1,9 @@
 //! The client: `coding check`, a thin HTTP caller for a box with no toolchain, no docker and no
 //! cluster access beyond a reachable URL.
 //!
-//! It packs the working tree, uploads it, asks for one `check` job and polls to a verdict. The
-//! exit code is the contract a hook or a pipeline branches on:
+//! It packs one snapshot of the repository (the working tree by default; the index for a
+//! pre-commit gate; HEAD for a pre-push gate), uploads it, asks for one `check` job and polls to a
+//! verdict. The exit code is the contract a hook or a pipeline branches on:
 //!
 //! | code | meaning |
 //! |---|---|
@@ -68,6 +69,8 @@ pub struct CheckArgs {
     pub kind: JobKind,
     /// `--profile`; `auto` (the default) detects the toolchain from the packed tree.
     pub profile: ProfileArg,
+    /// Which snapshot to pack: the working tree (default), the index, or HEAD.
+    pub snapshot: pack::Snapshot,
     pub timeout_seconds: u32,
     /// Print the job JSON instead of the human verdict.
     pub json: bool,
@@ -132,7 +135,7 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     // the CLI reads `coding.token` from the same git config the hook already uses.
     let token = resolve_token(args.token.clone(), git_config(&dir, "coding.token"));
 
-    let tree = pack::collect(&dir).map_err(|err| match err {
+    let tree = pack::collect(&dir, args.snapshot).map_err(|err| match err {
         pack::PackError::Usage(message) => ClientError::Usage(message),
         pack::PackError::Io(message) => ClientError::Infra(message),
     })?;
@@ -144,6 +147,7 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     }
     let profile = detect_profile(&tree, args.profile)?;
     println!("profile: {}", profile.as_str());
+    println!("snapshot: {}", args.snapshot.as_str());
     let blob = pack::pack(&tree).map_err(|err| ClientError::Infra(err.to_string()))?;
     let sha256 = crate::source_archive::sha256_hex(&blob);
     let total = tree.bytes();

@@ -19,8 +19,10 @@ CODING_URL=http://127.0.0.1:8687 coding check          # every check, one Pod
 CODING_URL=http://127.0.0.1:8687 coding check --kind lint   # static checks only
 CODING_URL=http://127.0.0.1:8687 coding check --profile python  # force a toolchain
 CODING_URL=http://127.0.0.1:8687 coding check --dry-run     # show what would be sent
-coding hook install                                     # pre-push gate
-coding hook install --hook pre-commit --kind lint       # committed fast gate, if you want one
+CODING_URL=http://127.0.0.1:8687 coding check --snapshot index   # what a commit would record
+CODING_URL=http://127.0.0.1:8687 coding check --snapshot head    # what a push sends
+coding hook install                                     # pre-push: build then test on HEAD
+coding hook install --hook pre-commit --kind lint       # commit: lint on the index
 git config coding.url http://127.0.0.1:8687             # what the hook reads
 
 # Behind the licence-gated gateway (api.nonagentic.ai/coding) every request carries
@@ -31,9 +33,11 @@ git config coding.token "$CODING_TOKEN"
 CODING_URL=https://api.nonagentic.ai/coding coding check
 ```
 
-What it sends: a gzip tar of `git ls-files` plus untracked-not-ignored files, read from the
-working tree — every tracked file, `target/` and `.env` never, and a fixed set of secret-shaped
-names (`*.pem`, `*.key`, `id_rsa*`, …) skipped with a warning. Caps: 32 MiB compressed, 128 MiB
+What it sends: a gzip tar of the selected **snapshot**. `--snapshot worktree` (the default) sends
+every tracked file plus untracked-not-ignored files as they are on disk; `--snapshot index` sends
+exactly what `git commit` would record; `--snapshot head` sends exactly what is committed, i.e.
+what a push sends. `target/` and `.env` never travel, and a fixed set of secret-shaped names
+(`*.pem`, `*.key`, `id_rsa*`, …) is skipped with a warning. Caps: 32 MiB compressed, 128 MiB
 uncompressed, 100 000 files, 32 MiB per file. The archive is stored once (tenant-scoped) and the
 Pod fetches it back with a capability token minted per attempt, verifying its sha256.
 
@@ -49,8 +53,13 @@ Exit codes are the contract a hook branches on:
 
 A **hook fails open**: only exit 1 blocks the push; an unreachable app lets it through with a
 warning, because a gate that blocks work when the service is down gets deleted. The hook reads
-`coding.url` / `coding.tenant` from git config and refuses to overwrite or remove a hook it did
-not write (use `--force`).
+`coding.url` / `coding.tenant` (and the client reads `coding.token`) from git config and refuses
+to overwrite or remove a hook it did not write (use `--force`).
+
+The hooks are snapshot- and gate-aware: the pre-push hook runs `build` and then `test` against
+**HEAD** as two separate requests, so a build failure is reported as a build failure and the test
+gate is marked not run; the pre-commit hook runs its `--kind` (default `lint`) against the
+**index**, i.e. exactly the commit.
 
 Measured latency (one cold Pod): a tiny crate is 12–43 s end to end; a medium Rust workspace is
 a few minutes (fmt + clippy + test). That is why pre-push is the default and `--kind lint` exists
