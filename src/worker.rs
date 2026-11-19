@@ -135,14 +135,20 @@ pub fn sandbox_executor(
         let api_url = api_url.clone();
         let github_app = github_app.clone();
         Box::pin(async move {
-            execute_sandbox(
-                &sandbox,
-                &pool,
-                api_url.as_deref(),
-                github_app.as_deref(),
-                claim,
-            )
-            .await
+            // `github_op` never reaches the sandbox: the worker performs the delivery with the
+            // App's write token, so no Pod ever holds it.
+            if claim.kind == crate::domain::JobKind::GithubOp {
+                crate::deliver::execute(&pool, github_app.as_deref(), claim).await
+            } else {
+                execute_sandbox(
+                    &sandbox,
+                    &pool,
+                    api_url.as_deref(),
+                    github_app.as_deref(),
+                    claim,
+                )
+                .await
+            }
         })
     })
 }
