@@ -582,3 +582,122 @@ async fn a_wrong_token_is_a_setup_failure_not_a_crash() {
         "{result:?}"
     );
 }
+
+/// A source that carries only an `OpenAPI` document — the parity fixture shape the two live
+/// repositories use (`conveyor-coding/py2rs-fixture-svc` and its Rust port).
+fn openapi_source(id_type: &str) -> Source {
+    let document = serde_json::json!({
+        "openapi": "3.1.0",
+        "paths": {"/api/jobs": {"get": {"responses": {"200": {"description": "ok",
+            "content": {"application/json": {"schema": {
+                "type": "object",
+                "required": ["id"],
+                "properties": {"id": {"type": id_type}}
+            }}}}}}}}
+    });
+    Source::Inline {
+        files: vec![InlineFile {
+            path: "openapi.json".to_owned(),
+            text: document.to_string(),
+        }],
+    }
+}
+
+fn parity_spec(target: &str, routes: &[(&str, &str)]) -> coding::domain::ParitySpec {
+    use coding::domain::{ParityMethod, ParityRoute, ParitySpec};
+    ParitySpec {
+        target: target.to_owned(),
+        routes: routes
+            .iter()
+            .map(|(method, path)| ParityRoute {
+                method: match *method {
+                    "get" => ParityMethod::Get,
+                    "post" => ParityMethod::Post,
+                    other => panic!("test uses a supported method, not {other}"),
+                },
+                path: (*path).to_owned(),
+            })
+            .collect(),
+    }
+}
+
+/// The parity job runs in-process on the materialised trees — no command, no database — and
+/// reports the comparison as a structured report plus its checks.
+#[tokio::test]
+async fn a_parity_job_compares_two_sources_without_running_a_command() {
+    let work = WorkDir::new("parity-equal");
+    let mut cancel = Cancellation::new().expect("signal handler");
+    let mut runner_spec = sources_spec(
+        JobKind::ParityOpenapi,
+        &[
+            ("target", Profile::Rust, openapi_source("string")),
+            ("source-1", Profile::Python, openapi_source("string")),
+        ],
+    );
+    runner_spec.input.parity = Some(parity_spec("target", &[("get", "/api/jobs")]));
+
+    let result = exec::run_in(&runner_spec, &mut cancel, work.source()).await;
+
+    assert_eq!(result.status, Status::Succeeded, "{result:?}");
+    assert_eq!(
+        result.checks.len(),
+        3,
+        "documents, diff, and the named-route rule: {result:?}"
+    );
+    assert!(result.checks.iter().all(|check| check.source.is_none()));
+    let report = result.parity.expect("a parity result carries its report");
+    assert_eq!(report.counts.routes, 1);
+    assert_eq!(report.counts.equal, 1);
+    assert!(!report.truncated);
+}
+
+#[tokio::test]
+async fn a_parity_difference_fails_the_job_and_names_its_pointer() {
+    let work = WorkDir::new("parity-differ");
+    let mut cancel = Cancellation::new().expect("signal handler");
+    let mut runner_spec = sources_spec(
+        JobKind::ParityOpenapi,
+        &[
+            ("target", Profile::Rust, openapi_source("integer")),
+            ("source-1", Profile::Python, openapi_source("string")),
+        ],
+    );
+    runner_spec.input.parity = Some(parity_spec("target", &[("get", "/api/jobs")]));
+
+    let result = exec::run_in(&runner_spec, &mut cancel, work.source()).await;
+
+    assert_eq!(result.status, Status::Failed, "{result:?}");
+    assert!(
+        result.error.is_none(),
+        "a difference is a verdict, not infra"
+    );
+    let report = result.parity.expect("report");
+    assert_eq!(report.counts.differ, 1);
+    let pointer = &report.routes[0].differences[0].pointer;
+    assert!(pointer.ends_with("/properties/id/type"), "{pointer}");
+}
+
+#[tokio::test]
+async fn a_parity_job_without_its_documents_is_a_failed_check_not_a_crash() {
+    let work = WorkDir::new("parity-missing-doc");
+    let mut cancel = Cancellation::new().expect("signal handler");
+    let mut runner_spec = sources_spec(
+        JobKind::ParityOpenapi,
+        &[
+            ("target", Profile::Rust, crate_source(false)),
+            ("source-1", Profile::Python, crate_source(false)),
+        ],
+    );
+    runner_spec.input.parity = Some(parity_spec("target", &[("get", "/api/jobs")]));
+
+    let result = exec::run_in(&runner_spec, &mut cancel, work.source()).await;
+
+    assert_eq!(result.status, Status::Failed, "{result:?}");
+    let report = result.parity.expect("report");
+    assert_eq!(report.errors.len(), 2, "both documents are missing");
+    assert!(
+        report.errors[0].contains("openapi.json"),
+        "{:?}",
+        report.errors
+    );
+}
