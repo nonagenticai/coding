@@ -148,6 +148,7 @@ fn config(api_url: &str) -> SandboxConfig {
         multi_source: true,
         nextest: true,
         runtime_class: "coding-kata".to_owned(),
+        runtime_class_large: Some("coding-kata-large".to_owned()),
         api_url: api_url.to_owned(),
         token: "test-token".to_owned(),
         ca_pem: None,
@@ -249,6 +250,9 @@ fn config_is_fail_closed() {
     )
     .expect("valid configuration");
     assert_eq!(config.runtime_class, "coding-kata");
+    // Unset means "no large profile configured": compile kinds fall back to `runtime_class`
+    // rather than naming a RuntimeClass the node may not carry.
+    assert!(config.runtime_class_large.is_none());
     assert!(config.ca_pem.is_none());
 }
 
@@ -285,7 +289,8 @@ fn manifest_is_restricted_and_carries_the_spec() {
     );
 
     let spec = &manifest["spec"];
-    assert_eq!(spec["runtimeClassName"], "coding-kata");
+    // Compile kinds need the VM *booted* with their memory; the small profile is the default.
+    assert_eq!(spec["runtimeClassName"], "coding-kata-large");
     assert_eq!(spec["restartPolicy"], "Never");
     // Cancel deletes the Pod, and the runner needs this window to write its final result.
     assert_eq!(spec["terminationGracePeriodSeconds"], 10);
@@ -333,16 +338,27 @@ fn manifest_is_restricted_and_carries_the_spec() {
     // request, because `requests.cpu` is quota-capped at 8 in `coding-runs` (8 concurrent jobs)
     // while `limits.cpu` is not capped at all. The LimitRange ceiling there is 6 CPU.
     //
-    // Memory is 6Gi because one compile alone can need most of 4: a single `clippy` on the
-    // heaviest workspace peaked at 3.9 GiB RSS (2026-11-19), which cannot fit a 4 GiB Pod once
-    // cargo, sccache and the OS are counted. 8Gi is not available to us: the kata VM itself is
-    // OOM-killed at that size on worker3 (measured with a probe Pod), while 6Gi boots. The
-    // namespace quota's `limits.memory` (64Gi) is then the concurrency ceiling, not a schedule
-    // limit.
+    // Memory is 10Gi for the compile kinds because `agent-api` codegen peaks at ~6.1 GiB and a
+    // 6 GiB guest leaves only ~5.2 GiB allocatable. That tier only exists because the Pod runs
+    // under the large kata profile, whose VM *boots* at 9 GiB: measured on worker3 2026-11-19, a
+    // Pod above ~6 GiB never had its memory hot-plugged at all (an 8 GiB Pod ran in a 162 MiB
+    // guest). The namespace quota's `limits.memory` (64Gi) is then the concurrency ceiling.
     assert_eq!(container["resources"]["requests"]["cpu"], "1");
     assert_eq!(container["resources"]["requests"]["memory"], "2Gi");
     assert_eq!(container["resources"]["limits"]["cpu"], "4");
-    assert_eq!(container["resources"]["limits"]["memory"], "6Gi");
+    assert_eq!(container["resources"]["limits"]["memory"], "10240Mi");
+
+    // Only the compile kinds take the large profile: a lint or analyze Pod keeps the small VM,
+    // so an isolated 5 ms tool run does not pay for a 9 GiB boot.
+    for kind in [JobKind::Lint, JobKind::Analyze, JobKind::Scan] {
+        let manifest = sandbox
+            .pod_manifest("job-small", "tenant-a", kind, &json!({}))
+            .expect("small manifest");
+        assert_eq!(
+            manifest["spec"]["runtimeClassName"], "coding-kata",
+            "{kind:?}"
+        );
+    }
 
     let analyze = sandbox
         .pod_manifest("job-2", "tenant-a", JobKind::Analyze, &json!({}))
@@ -351,7 +367,7 @@ fn manifest_is_restricted_and_carries_the_spec() {
     assert_eq!(analyze["requests"]["cpu"], "500m");
     assert_eq!(analyze["requests"]["memory"], "1Gi");
     assert_eq!(analyze["limits"]["cpu"], "1");
-    assert_eq!(analyze["limits"]["memory"], "2Gi");
+    assert_eq!(analyze["limits"]["memory"], "2048Mi");
 }
 
 #[test]

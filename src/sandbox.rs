@@ -47,6 +47,11 @@ pub const PROFILES_ENV: &str = "CODING_RUNNER_PROFILES";
 pub const NEXTEST_ENV: &str = "CODING_RUNNER_NEXTEST";
 /// `CODING_KATA_RUNTIME_CLASS`: the `RuntimeClass` that puts the Pod on the kata runtime.
 pub const RUNTIME_CLASS_ENV: &str = "CODING_KATA_RUNTIME_CLASS";
+/// `CODING_KATA_RUNTIME_CLASS_LARGE`: the `RuntimeClass` used for the compile kinds (`build`,
+/// `test`, `check`), whose VMs must boot with more memory than the default profile. Absent falls
+/// back to [`RUNTIME_CLASS_ENV`], so a deployment that has not been told about the large profile
+/// keeps its previous behaviour instead of naming a class the node does not have.
+pub const RUNTIME_CLASS_LARGE_ENV: &str = "CODING_KATA_RUNTIME_CLASS_LARGE";
 /// `CODING_RUNS_PULL_SECRET`: the imagePullSecret in the runs namespace. The runner image is
 /// private, and a Pod created with the default `ServiceAccount` has no pull credential — without
 /// this the run dies in `ImagePullBackOff`. Empty omits the field (public image).
@@ -234,6 +239,9 @@ pub struct SandboxConfig {
     pub nextest: bool,
     /// The `RuntimeClass` that selects the kata runtime.
     pub runtime_class: String,
+    /// The `RuntimeClass` for compile kinds, whose VMs must boot with the compile tier's memory.
+    /// `None` means "use [`Self::runtime_class`]" — see [`RUNTIME_CLASS_LARGE_ENV`].
+    pub runtime_class_large: Option<String>,
     /// The API server base URL, e.g. `https://10.43.0.1:443`.
     pub api_url: String,
     /// The service-account bearer token.
@@ -296,6 +304,7 @@ impl SandboxConfig {
 
         let runtime_class =
             get(RUNTIME_CLASS_ENV).unwrap_or_else(|| DEFAULT_RUNTIME_CLASS.to_owned());
+        let runtime_class_large = get(RUNTIME_CLASS_LARGE_ENV);
         let profiles = profiles_from(get(PROFILES_ENV).as_deref())?;
         let multi_source = flag_from(get(MULTI_SOURCE_ENV).as_deref());
         let nextest = flag_from(get(NEXTEST_ENV).as_deref());
@@ -414,6 +423,7 @@ impl SandboxConfig {
             multi_source,
             nextest,
             runtime_class,
+            runtime_class_large,
             api_url,
             token,
             ca_pem,
@@ -614,6 +624,26 @@ impl Sandbox {
         &self.config.namespace
     }
 
+    /// The `RuntimeClass` a Pod of this kind runs under.
+    ///
+    /// The compile kinds use the large profile when one is configured: their VM has to **boot**
+    /// with the compile tier's memory. Measured on worker3 2026-11-19 — kata sizes every VM at
+    /// `default_memory` (256 MiB in the small profile) and memory above ~6 GiB is never hot-plugged
+    /// into it, so an 8 GiB Pod saw a 162 MiB guest. `default_memory` is a per-`ConfigPath` value,
+    /// which is why the large profile is a separate handler and `RuntimeClass` rather than a Pod
+    /// annotation: the `io.katacontainers.config.hypervisor.default_memory` annotation is accepted
+    /// but does not move the boot size on kata 3.31.0.
+    fn runtime_class_for(&self, kind: JobKind) -> &str {
+        match kind {
+            JobKind::Build | JobKind::Test | JobKind::Check => self
+                .config
+                .runtime_class_large
+                .as_deref()
+                .unwrap_or(&self.config.runtime_class),
+            _ => &self.config.runtime_class,
+        }
+    }
+
     /// The deterministic Pod name for a job. A repeated create therefore names the same object
     /// and the API answers `409`, which [`Sandbox::create_run`] treats as a reattach.
     #[must_use]
@@ -701,7 +731,7 @@ impl Sandbox {
                 "annotations": annotations,
             },
             "spec": {
-                "runtimeClassName": self.config.runtime_class,
+                "runtimeClassName": self.runtime_class_for(kind),
                 "restartPolicy": "Never",
                 // Cancel deletes the Pod; the runner needs this window to write its result.
                 "terminationGracePeriodSeconds": 10,
@@ -1130,17 +1160,24 @@ impl Sandbox {
 /// process on `agent-api` peaked at **3.9 GiB RSS**, leaving nothing of a 4 GiB Pod for cargo,
 /// sccache and the OS — the kernel killed it with `SIGKILL` even with two compile jobs.
 ///
-/// ⚠️ Not 8 either: the kata VM itself cannot take it. Measured the same day with a trivial probe
-/// Pod (`grep MemTotal /proc/meminfo`, no compiler): an 8 GiB limit is OOM-killed at VM start on
-/// worker3, while 6 GiB boots with `MemTotal` 6,457,056 kB. The guest also reports 8 CPUs whatever
-/// the CPU limit, which is why `CARGO_BUILD_JOBS` — not the cgroup — is what bounds parallelism.
-/// The `coding-runs` `ResourceQuota` (`limits.memory: 64Gi`) then admits eight of these.
+/// ⚠️ 10 GiB for the compile kinds, because `agent-api` **codegen** peaks at ~6.1 GiB and a 6 GiB
+/// VM guest leaves only ~5.2 GiB allocatable. That headroom only exists when the VM *boots* with
+/// the memory: measured on worker3 2026-11-19, a Pod above ~6 GiB never had its memory hot-plugged
+/// at all (an 8 GiB Pod ran in a 162 MiB guest), which is why the compile kinds select the large
+/// kata profile — see [`Sandbox::runtime_class_for`]. The large profile boots 9 GiB and the last
+/// 1 GiB arrives over the one hot-plug size that was measured to work.
+///
+/// The guest reports 8 CPUs whatever the CPU limit, which is why `CARGO_BUILD_JOBS` — not the
+/// cgroup — is what bounds parallelism. The `coding-runs` `ResourceQuota` (`limits.memory: 64Gi`)
+/// admits six of the 10 GiB Pods.
 #[must_use]
 pub fn resources_for(kind: JobKind) -> Value {
-    let (request_cpu, request_memory, limit_cpu, limit_memory) = match kind {
-        JobKind::Test | JobKind::Build | JobKind::Lint | JobKind::Check => ("1", "2Gi", "4", "6Gi"),
-        _ => ("500m", "1Gi", "1", "2Gi"),
+    let (request_cpu, request_memory, limit_cpu, limit_memory_mib) = match kind {
+        JobKind::Build | JobKind::Test | JobKind::Check => ("1", "2Gi", "4", 10_240),
+        JobKind::Lint => ("1", "2Gi", "4", 6_144),
+        _ => ("500m", "1Gi", "1", 2_048),
     };
+    let limit_memory = format!("{limit_memory_mib}Mi");
     json!({
         "requests": { "cpu": request_cpu, "memory": request_memory },
         "limits": { "cpu": limit_cpu, "memory": limit_memory },
@@ -1255,9 +1292,12 @@ mod tests {
             }
         }
         fn mebibytes(raw: &str) -> i64 {
-            match raw.strip_suffix("Gi") {
-                Some(value) => value.parse::<i64>().expect("GiB") * 1024,
-                None => raw.parse::<i64>().expect("MiB"),
+            match raw.strip_suffix("Mi") {
+                Some(value) => value.parse::<i64>().expect("MiB"),
+                None => match raw.strip_suffix("Gi") {
+                    Some(value) => value.parse::<i64>().expect("GiB") * 1024,
+                    None => panic!("{raw:?} is not a memory quantity"),
+                },
             }
         }
 
