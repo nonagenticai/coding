@@ -204,3 +204,46 @@ jobs:
             docker push "$ref:$tag"
           done
           echo "pushed $ref:$sha $ref:$run $ref:latest"
+
+  # ── The gate, dogfooded on this repository's own CI ───────────────────────
+  # Builds the client and runs the app's own plan (fmt/clippy/test) in a kata Pod on
+  # this PR's HEAD. The licence token lives ONLY in Actions secrets; a fork PR never
+  # receives secrets, so the job is skipped there — this comment is the recorded
+  # reason. CODING_GATE_STRICT=1 makes an infrastructure failure (exit 3) fail too:
+  # in the app's own CI a dead gate is not a pass.
+  gate:
+    if: ${{ !github.event.repository.private && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: toolchain follows rust-toolchain.toml
+        run: |
+          set -euo pipefail
+          rustup show
+          rustc --version
+
+      - uses: actions/cache@v6
+        with:
+          # Registry only: target/ is multi-gigabyte and would thrash the cache budget.
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: build the client
+        run: cargo build --release --locked --bin coding
+
+      - name: coding gate — the app checks this repository's HEAD
+        env:
+          CODING_TOKEN: ${{ secrets.CODING_GATE_TOKEN }}
+          CODING_GATE_STRICT: "1"
+        run: |
+          set -euo pipefail
+          ./target/release/coding check --kind check --snapshot head \
+            --url https://api.nonagentic.ai/coding
