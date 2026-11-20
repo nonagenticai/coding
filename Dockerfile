@@ -1,11 +1,11 @@
 # coding image (same shape as strata-rag's Dockerfile).
 #
-# The builder is debian:12-slim with a pinned toolchain installed by rustup; builder and
+# The builder is debian:13-slim with a pinned toolchain installed by rustup; builder and
 # runtime share one glibc.
 # RUST_TOOLCHAIN must equal rust-toolchain.toml and images/runner/Dockerfile.
 ARG RUST_TOOLCHAIN=1.100.0
 
-FROM debian:12-slim AS build
+FROM debian:13-slim AS build
 ARG RUST_TOOLCHAIN
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # cmake/perl: aws-lc-sys (rustls' default crypto provider, via sqlx tls-rustls).
@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --locked \
     && install -D -m 0755 target/release/coding /out/service
 
-FROM debian:12-slim AS runtime
+FROM debian:13-slim AS runtime
 # ca-certificates: outbound https (rustls-native-certs). curl: the HEALTHCHECK.
 # hadolint ignore=DL3008
 RUN apt-get update \
