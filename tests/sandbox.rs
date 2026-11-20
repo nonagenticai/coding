@@ -348,9 +348,20 @@ fn manifest_is_restricted_and_carries_the_spec() {
     assert_eq!(container["resources"]["limits"]["cpu"], "4");
     assert_eq!(container["resources"]["limits"]["memory"], "10240Mi");
 
-    // Only the compile kinds take the large profile: a lint or analyze Pod keeps the small VM,
-    // so an isolated 5 ms tool run does not pay for a 9 GiB boot.
-    for kind in [JobKind::Lint, JobKind::Analyze, JobKind::Scan] {
+    // `lint` shares the large profile: the gate lints generated code, and `agent`'s lint plan
+    // peaks at ~6.1 GiB — the small VM's ~6 GiB boot size kills that Pod whatever its limit says.
+    let lint = sandbox
+        .pod_manifest("job-lint", "tenant-a", JobKind::Lint, &json!({}))
+        .expect("lint manifest");
+    assert_eq!(lint["spec"]["runtimeClassName"], "coding-kata-large");
+    let lint = &lint["spec"]["containers"][0]["resources"];
+    assert_eq!(lint["requests"]["memory"], "2Gi");
+    assert_eq!(lint["limits"]["cpu"], "4");
+    assert_eq!(lint["limits"]["memory"], "7168Mi");
+
+    // Only the single-tool kinds take the small profile, so an isolated 5 ms tool run does not
+    // pay for a 9 GiB boot.
+    for kind in [JobKind::Analyze, JobKind::Scan] {
         let manifest = sandbox
             .pod_manifest("job-small", "tenant-a", kind, &json!({}))
             .expect("small manifest");
