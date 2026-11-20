@@ -1,0 +1,44 @@
+# The compile gate, without a local compiler.
+#
+# Local Rust compilation is retired on this estate (rbuild and m1 are gone), so the first answer
+# to "does this tree compile?" is a GitHub-hosted runner. This workflow gives that answer on the
+# branch a session has to push anyway — lane/**, issue/**, slice/** — minutes after the push,
+# instead of after the PR's own `checks` job pays for a cold dependency restore.
+#
+# What it runs: `cargo fmt --check` and `cargo clippy --all-targets --locked -- -D warnings`,
+# the same verdict the PR's `checks` job gives, so a warning here is a red there.
+#
+# What it is NOT: a second CI, and not a required status. It writes no check that a branch
+# protection rule reads; `checks` on pull_request stays the required context. A push-triggered
+# preflight is deliberately not the lane rule's "never push to see what CI says" — that rule
+# forbids using the PR as a compiler. This fires on a branch the lane already pushes, is
+# superseded by its next push via the concurrency group below, and blocks nothing.
+#
+# `cache_shared_key` must equal the `checks` job's Swatinem/rust-cache `shared-key` in
+# ci-public.yml, or the first preflight on every branch pays a cold compile. A preflight never
+# saves (`save-if` is main-only inside the reusable workflow), so it can only borrow the cache
+# the repository's main run wrote — it can never evict it.
+name: preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['issue/**', 'lane/**', 'slice/**']
+
+# One preflight per ref: a new push cancels the one it supersedes. Nothing downstream waits on
+# this run, so cancelling is always the right trade.
+concurrency:
+  group: 'preflight-${{ github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    # Pinned to ci-workflows main@d2ae87a4 (2026-11-20). A moving branch would let an unreviewed
+    # change to the reusable workflow land in this repository's CI with no diff here.
+    uses: nonagenticai/ci-workflows/.github/workflows/rust-preflight.yml@d2ae87a417b00013838ba18841cdd1642b83fb89
+    with:
+      # No `package`: the `checks` job lints the whole workspace, and a break in a sibling crate
+      # is still a break. No `needs_postgres`: compile needs no database here (the workspace's
+      # sqlx usage is runtime, not `query!` macros — `checks` sets TEST_DATABASE_URL, not
+      # DATABASE_URL).
+      cache_shared_key: checks
