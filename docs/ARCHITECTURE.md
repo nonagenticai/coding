@@ -63,8 +63,9 @@ the Pod is where untrusted input is parsed. Its marker is the document itself, n
 `src/sandbox.rs` builds the Pod: read-only root, one 8 GiB `emptyDir` at `/tmp`, the pinned
 `CODING_RUNNER_IMAGE`, and only `CODING_JOB_SPEC` in the environment. Resources follow the kind:
 `build`/`test`/`check` request 1 CPU / 2 GiB and limit 4 CPU / 10 GiB on the large kata profile
-(its VM must *boot* with the memory — above ~6 GiB it is never hot-plugged); `lint` limits 4 CPU /
-6 GiB; everything else 500m / 1 CPU / 2 GiB. Profile and multi-source capability are refused
+(its VM must *boot* with the memory — above ~6 GiB it is never hot-plugged); `lint` shares that
+profile and limits 4 CPU / 7 GiB; everything else 500m / 1 CPU / 2 GiB. Profile and multi-source
+capability are refused
 **before a Pod exists** when the pinned runner image predates them (`CODING_RUNNER_PROFILES`,
 `CODING_RUNNER_MULTI_SOURCE`).
 

@@ -48,9 +48,9 @@ pub const NEXTEST_ENV: &str = "CODING_RUNNER_NEXTEST";
 /// `CODING_KATA_RUNTIME_CLASS`: the `RuntimeClass` that puts the Pod on the kata runtime.
 pub const RUNTIME_CLASS_ENV: &str = "CODING_KATA_RUNTIME_CLASS";
 /// `CODING_KATA_RUNTIME_CLASS_LARGE`: the `RuntimeClass` used for the compile kinds (`build`,
-/// `test`, `check`), whose VMs must boot with more memory than the default profile. Absent falls
-/// back to [`RUNTIME_CLASS_ENV`], so a deployment that has not been told about the large profile
-/// keeps its previous behaviour instead of naming a class the node does not have.
+/// `test`, `check`) and `lint`, whose VMs must boot with more memory than the default profile.
+/// Absent falls back to [`RUNTIME_CLASS_ENV`], so a deployment that has not been told about the
+/// large profile keeps its previous behaviour instead of naming a class the node does not have.
 pub const RUNTIME_CLASS_LARGE_ENV: &str = "CODING_KATA_RUNTIME_CLASS_LARGE";
 /// `CODING_RUNS_PULL_SECRET`: the imagePullSecret in the runs namespace. The runner image is
 /// private, and a Pod created with the default `ServiceAccount` has no pull credential — without
@@ -239,8 +239,8 @@ pub struct SandboxConfig {
     pub nextest: bool,
     /// The `RuntimeClass` that selects the kata runtime.
     pub runtime_class: String,
-    /// The `RuntimeClass` for compile kinds, whose VMs must boot with the compile tier's memory.
-    /// `None` means "use [`Self::runtime_class`]" — see [`RUNTIME_CLASS_LARGE_ENV`].
+    /// The `RuntimeClass` for compile kinds and `lint`, whose VMs must boot with their tier's
+    /// memory. `None` means "use [`Self::runtime_class`]" — see [`RUNTIME_CLASS_LARGE_ENV`].
     pub runtime_class_large: Option<String>,
     /// The API server base URL, e.g. `https://10.43.0.1:443`.
     pub api_url: String,
@@ -626,16 +626,18 @@ impl Sandbox {
 
     /// The `RuntimeClass` a Pod of this kind runs under.
     ///
-    /// The compile kinds use the large profile when one is configured: their VM has to **boot**
-    /// with the compile tier's memory. Measured on worker3 2026-11-19 — kata sizes every VM at
+    /// The compile kinds and `lint` use the large profile when one is configured: their VM has to
+    /// **boot** with their memory. Measured on worker3 2026-11-19 — kata sizes every VM at
     /// `default_memory` (256 MiB in the small profile) and memory above ~6 GiB is never hot-plugged
-    /// into it, so an 8 GiB Pod saw a 162 MiB guest. `default_memory` is a per-`ConfigPath` value,
-    /// which is why the large profile is a separate handler and `RuntimeClass` rather than a Pod
-    /// annotation: the `io.katacontainers.config.hypervisor.default_memory` annotation is accepted
-    /// but does not move the boot size on kata 3.31.0.
+    /// into it, so an 8 GiB Pod saw a 162 MiB guest. `lint` belongs here because the gate lints
+    /// generated code too, and `agent`'s lint plan peaks at ~6.1 GiB — a Pod the small profile
+    /// admits and then OOM-kills at the guest's boot size. `default_memory` is a per-`ConfigPath`
+    /// value, which is why the large profile is a separate handler and `RuntimeClass` rather than a
+    /// Pod annotation: the `io.katacontainers.config.hypervisor.default_memory` annotation is
+    /// accepted but does not move the boot size on kata 3.31.0.
     fn runtime_class_for(&self, kind: JobKind) -> &str {
         match kind {
-            JobKind::Build | JobKind::Test | JobKind::Check => self
+            JobKind::Build | JobKind::Test | JobKind::Check | JobKind::Lint => self
                 .config
                 .runtime_class_large
                 .as_deref()
@@ -1167,14 +1169,20 @@ impl Sandbox {
 /// kata profile — see [`Sandbox::runtime_class_for`]. The large profile boots 9 GiB and the last
 /// 1 GiB arrives over the one hot-plug size that was measured to work.
 ///
+/// ⚠️ `lint` takes the large profile for the same reason with a smaller limit: the gate lints
+/// generated code, and `agent`'s lint plan peaks at ~6.1 GiB — below the 8 GiB Pod the small
+/// profile admits, but above the ~6 GiB guest it boots, so admission succeeded and the OOM arrived
+/// mid-run. 7168 Mi sits under the ~8.2 GiB allocatable of the 9 GiB boot, so the limit is
+/// honoured rather than clamped.
+///
 /// The guest reports 8 CPUs whatever the CPU limit, which is why `CARGO_BUILD_JOBS` — not the
 /// cgroup — is what bounds parallelism. The `coding-runs` `ResourceQuota` (`limits.memory: 64Gi`)
-/// admits six of the 10 GiB Pods.
+/// admits six of the 10 GiB Pods, or nine of the 7 GiB lint Pods.
 #[must_use]
 pub fn resources_for(kind: JobKind) -> Value {
     let (request_cpu, request_memory, limit_cpu, limit_memory_mib) = match kind {
         JobKind::Build | JobKind::Test | JobKind::Check => ("1", "2Gi", "4", 10_240),
-        JobKind::Lint => ("1", "2Gi", "4", 6_144),
+        JobKind::Lint => ("1", "2Gi", "4", 7_168),
         _ => ("500m", "1Gi", "1", 2_048),
     };
     let limit_memory = format!("{limit_memory_mib}Mi");
@@ -1334,6 +1342,22 @@ mod tests {
                 "{kind:?}: {limit_memory}Mi is over the 12Gi LimitRange ceiling"
             );
         }
+    }
+
+    /// `lint` is a compile-sized job: it runs `clippy` over the whole workspace, generated code
+    /// included, and `agent`'s lint plan peaks at ~6.1 GiB. Pin the tier so a future refactor
+    /// cannot quietly return it to the 6 GiB Pod the small kata VM OOM-kills.
+    #[test]
+    fn lint_gets_the_large_tier_memory() {
+        let resources = resources_for(JobKind::Lint);
+        assert_eq!(resources["requests"]["memory"], "2Gi");
+        assert_eq!(resources["limits"]["cpu"], "4");
+        assert_eq!(resources["limits"]["memory"], "7168Mi");
+        // The single-tool kinds stay where they were.
+        assert_eq!(
+            resources_for(JobKind::Analyze)["limits"]["memory"],
+            "2048Mi"
+        );
     }
 
     #[test]
