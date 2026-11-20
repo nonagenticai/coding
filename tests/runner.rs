@@ -172,7 +172,9 @@ async fn the_result_serialises_under_coding_result() {
     assert_eq!(value["checks"][0]["name"], "cargo test --doc");
 }
 
-/// A `check` job runs all three gates in one Pod, and reports each of them.
+/// A `check` job runs every gate in one Pod — lint, then the same test plan CI runs — and
+/// reports each step. The four names are the assertion: when `check` was a hand-written copy it
+/// kept a plain `cargo test` long after the `test` kind moved to nextest.
 #[tokio::test]
 async fn a_check_job_runs_fmt_clippy_and_test() {
     let work = WorkDir::new("check");
@@ -185,7 +187,15 @@ async fn a_check_job_runs_fmt_clippy_and_test() {
     .await;
     assert_eq!(result.status, Status::Succeeded, "{result:?}");
     let names: Vec<&str> = result.checks.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["cargo fmt", "cargo clippy", "cargo test"]);
+    assert_eq!(
+        names,
+        [
+            "cargo fmt",
+            "cargo clippy",
+            "cargo test --doc",
+            "cargo nextest"
+        ]
+    );
     for check in &result.checks {
         assert_eq!(check.exit_code, Some(0), "{check:?}");
         assert!(

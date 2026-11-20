@@ -69,10 +69,53 @@ pub fn needs_redis(kind: JobKind) -> bool {
     matches!(kind, JobKind::Test | JobKind::Check)
 }
 
-/// The Rust plans: one compiled-in table per runnable kind. The pre-commit gate lists the same
-/// three checks as `lint` plus `test`, in the order that fails fastest, so a formatting problem
-/// never hides a failing test.
-/// The Rust test plan mirrors what CI runs, and the choice of runner is not cosmetic.
+/// The Rust plans: one compiled-in table per runnable kind, built from named steps so `check` —
+/// the client's default kind — is literally `lint` followed by `test`, in the order that fails
+/// fastest. It used to carry its own copy, and that copy still ran plain `cargo test` after the
+/// `test` kind moved to nextest: the same 894 s suite, on the path a bare `coding check` takes.
+const RUST_CHECK: &[Planned] = &[RUST_FMT, RUST_CLIPPY, RUST_DOCTEST, RUST_NEXTEST];
+
+/// `cargo fmt --check`: the fastest failure, and the first step CI runs.
+const RUST_FMT: Planned = Planned {
+    name: "cargo fmt",
+    program: "cargo",
+    args: &["fmt", "--check"],
+    needs_database: false,
+    needs_redis: false,
+};
+
+/// CI's lint step, argument for argument. `--locked` matters: a gate that silently resolves a
+/// newer dependency is judging a tree CI will never build.
+const RUST_CLIPPY: Planned = Planned {
+    name: "cargo clippy",
+    program: "cargo",
+    args: &[
+        "clippy",
+        "--all-targets",
+        "--locked",
+        "--",
+        "-D",
+        "warnings",
+    ],
+    needs_database: false,
+    needs_redis: false,
+};
+
+/// Doctests stay: nextest does not run them, and CI runs both for the same reason.
+///
+/// ⚠️ Order matters, and not for reporting: the throwaway `PostgreSQL`/Redis cluster is started
+/// lazily immediately before the step that needs it and dies if it sits idle, so the doctest run —
+/// which needs neither — goes FIRST and the suite that needs them is LAST. Doctests are also the
+/// faster failure.
+const RUST_DOCTEST: Planned = Planned {
+    name: "cargo test --doc",
+    program: "cargo",
+    args: &["test", "--doc", "--locked"],
+    needs_database: false,
+    needs_redis: false,
+};
+
+/// The suite itself, under the runner CI uses. The choice is not cosmetic.
 ///
 /// `cargo test` executes a workspace's test binaries ONE AT A TIME. On a workspace with hundreds
 /// of integration-test files that is not a slower measurement of the same thing, it is a
@@ -81,53 +124,25 @@ pub fn needs_redis(kind: JobKind) -> bool {
 /// took 894 s and twice exceeded the 1800 s budget, while the same suite under `nextest` takes
 /// about 170 s in CI. A timeout exits 3 and the hook FAILS OPEN, so the real cost was 30 minutes
 /// of a blocked push buying no verdict at all.
-///
-/// `cargo test --doc` stays: nextest does not run doctests, and CI runs both for the same reason.
-/// ⚠️ Order matters, and not for reporting: the throwaway `PostgreSQL`/Redis cluster is started
-/// lazily immediately before the step that needs it and dies if it sits idle, so the doctest run —
-/// which needs neither — goes FIRST and the suite that needs them is LAST. Doctests are also the
-/// faster failure, which is the ordering rule the other plans already follow.
-const RUST_TEST: &[Planned] = &[
-    Planned {
-        name: "cargo test --doc",
-        program: "cargo",
-        args: &["test", "--doc", "--locked"],
-        needs_database: false,
-        needs_redis: false,
-    },
-    Planned {
-        name: "cargo nextest",
-        program: "cargo-nextest",
-        args: &[
-            "nextest",
-            "run",
-            "--no-tests",
-            "fail",
-            "--color",
-            "never",
-            "--locked",
-        ],
-        needs_database: true,
-        needs_redis: true,
-    },
-];
+const RUST_NEXTEST: Planned = Planned {
+    name: "cargo nextest",
+    program: "cargo-nextest",
+    args: &[
+        "nextest",
+        "run",
+        "--no-tests",
+        "fail",
+        "--color",
+        "never",
+        "--locked",
+    ],
+    needs_database: true,
+    needs_redis: true,
+};
 
-const RUST_LINT: &[Planned] = &[
-    Planned {
-        name: "cargo fmt",
-        program: "cargo",
-        args: &["fmt", "--check"],
-        needs_database: false,
-        needs_redis: false,
-    },
-    Planned {
-        name: "cargo clippy",
-        program: "cargo",
-        args: &["clippy", "--all-targets", "--", "-D", "warnings"],
-        needs_database: false,
-        needs_redis: false,
-    },
-];
+const RUST_TEST: &[Planned] = &[RUST_DOCTEST, RUST_NEXTEST];
+
+const RUST_LINT: &[Planned] = &[RUST_FMT, RUST_CLIPPY];
 
 const RUST_BUILD: &[Planned] = &[Planned {
     name: "cargo build",
@@ -136,37 +151,6 @@ const RUST_BUILD: &[Planned] = &[Planned {
     needs_database: false,
     needs_redis: false,
 }];
-
-const RUST_CHECK: &[Planned] = &[
-    Planned {
-        name: "cargo fmt",
-        program: "cargo",
-        args: &["fmt", "--check"],
-        needs_database: false,
-        needs_redis: false,
-    },
-    Planned {
-        name: "cargo clippy",
-        program: "cargo",
-        args: &[
-            "clippy",
-            "--all-targets",
-            "--locked",
-            "--",
-            "-D",
-            "warnings",
-        ],
-        needs_database: false,
-        needs_redis: false,
-    },
-    Planned {
-        name: "cargo test",
-        program: "cargo",
-        args: &["test", "--locked"],
-        needs_database: true,
-        needs_redis: true,
-    },
-];
 
 /// The Python plans mirror the estate's Python archetype command for command (`uv lock --check`,
 /// `uv sync --all-extras`, `ruff check`, `ruff format --check`, `ty check`, `pytest`), so the
@@ -407,6 +391,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_check_plan_is_lint_then_test() {
+        // `check` claims to run every check the toolchain runs. If it is not literally the two
+        // plans it advertises, it drifts — which is exactly how it kept a plain `cargo test`
+        // after the `test` kind moved to nextest.
+        let check = plan(Profile::Rust, JobKind::Check).expect("runnable kind");
+        let mut expected = Vec::new();
+        expected.extend_from_slice(plan(Profile::Rust, JobKind::Lint).expect("runnable kind"));
+        expected.extend_from_slice(plan(Profile::Rust, JobKind::Test).expect("runnable kind"));
+        assert_eq!(check, expected.as_slice());
     }
 
     #[test]
