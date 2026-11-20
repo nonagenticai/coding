@@ -226,7 +226,7 @@ fn build_from_entries(
         return Err(PackError::Usage(format!("{what} has no files to check")));
     }
     let shas: Vec<String> = wanted.iter().map(|(_, _, sha)| sha.clone()).collect();
-    let blobs = read_blobs(root, &shas)?;
+    let blobs = read_blobs(root, shas)?;
     let mut files = Vec::with_capacity(wanted.len());
     for (path, executable, sha) in wanted {
         let Some(data) = blobs.get(&sha) else {
@@ -259,7 +259,15 @@ fn build_from_entries(
 
 /// Read every blob in one `git cat-file --batch` process. Spawning git once per file would make a
 /// large repository's gate minutes slower than the checks themselves.
-fn read_blobs(root: &Path, shas: &[String]) -> Result<HashMap<String, Vec<u8>>, PackError> {
+///
+/// The requests are written on their own thread **while** the responses are read. Writing every
+/// sha first deadlocks any tree past ~1,500 files on Linux: `git cat-file` fills its 64 KiB stdout
+/// pipe with a blob and stops reading, the client fills its 64 KiB stdin pipe with shas and stops
+/// writing, and neither moves. Measured 2026-11-19 on the fleet gate: agent's 1,698-file HEAD sat
+/// for 43 minutes until the job timeout, leaving an orphaned `git`. macOS pipes grow with the
+/// write, which is why every local run passed.
+fn read_blobs(root: &Path, shas: Vec<String>) -> Result<HashMap<String, Vec<u8>>, PackError> {
+    let count = shas.len();
     let mut child = Command::new("git")
         .arg("-C")
         .arg(root)
@@ -268,25 +276,51 @@ fn read_blobs(root: &Path, shas: &[String]) -> Result<HashMap<String, Vec<u8>>, 
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|err| PackError::Io(format!("git cat-file could not start: {err}")))?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| PackError::Io("git cat-file has no stdin".to_owned()))?;
-        for sha in shas {
-            writeln!(stdin, "{sha}")
-                .map_err(|err| PackError::Io(format!("git cat-file write failed: {err}")))?;
-        }
-        // The handle drops here, so cat-file sees EOF after the queued commands instead of
-        // waiting for more input while `wait()` blocks below.
-    }
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| PackError::Io("git cat-file has no stdin".to_owned()))?;
     let stdout = child
         .stdout
         .take()
         .ok_or_else(|| PackError::Io("git cat-file has no stdout".to_owned()))?;
-    let mut reader = BufReader::new(stdout);
-    let mut blobs = HashMap::with_capacity(shas.len());
-    for _ in 0..shas.len() {
+    let writer = std::thread::spawn(move || -> Result<(), String> {
+        for sha in &shas {
+            writeln!(stdin, "{sha}").map_err(|err| format!("git cat-file write failed: {err}"))?;
+        }
+        // The handle drops here, so cat-file sees EOF after the queued commands instead of
+        // waiting for more input while the read side finishes.
+        Ok(())
+    });
+    let read = read_batch(BufReader::new(stdout), count);
+    if read.is_err() {
+        // A failed read leaves git writing into a full pipe; the kill releases the writer thread.
+        let _ = child.kill();
+    }
+    let wrote = writer
+        .join()
+        .map_err(|_| PackError::Io("the git cat-file writer panicked".to_owned()))?;
+    let blobs = match (read, wrote) {
+        (_, Err(error)) => return Err(PackError::Io(error)),
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(blobs), Ok(())) => blobs,
+    };
+    let status = child
+        .wait()
+        .map_err(|err| PackError::Io(format!("git cat-file wait failed: {err}")))?;
+    if !status.success() {
+        return Err(PackError::Io("git cat-file exited non-zero".to_owned()));
+    }
+    Ok(blobs)
+}
+
+/// Read `count` batch responses: for each, a `<sha> <kind> <size>` header, the blob, and a newline.
+fn read_batch(
+    mut reader: BufReader<std::process::ChildStdout>,
+    count: usize,
+) -> Result<HashMap<String, Vec<u8>>, PackError> {
+    let mut blobs = HashMap::with_capacity(count);
+    for _ in 0..count {
         let mut header = String::new();
         reader
             .read_line(&mut header)
@@ -310,12 +344,6 @@ fn read_blobs(root: &Path, shas: &[String]) -> Result<HashMap<String, Vec<u8>>, 
             .read_exact(&mut newline)
             .map_err(|err| PackError::Io(format!("git cat-file read failed: {err}")))?;
         blobs.insert(sha, data);
-    }
-    let status = child
-        .wait()
-        .map_err(|err| PackError::Io(format!("git cat-file wait failed: {err}")))?;
-    if !status.success() {
-        return Err(PackError::Io("git cat-file exited non-zero".to_owned()));
     }
     Ok(blobs)
 }
@@ -543,6 +571,53 @@ mod tests {
         let blob = pack(&tree).expect("pack");
         assert!(source_archive::validate(&blob).is_ok());
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_larger_than_a_pipe_buffer_packs_without_deadlocking() {
+        // 2,000 extra blobs: more sha bytes than a Linux pipe holds (64 KiB). The old writer
+        // pushed every sha before reading any response, so `git cat-file` filled its stdout pipe
+        // with a blob while the client filled its stdin pipe with shas, and neither moved — the
+        // first real CI gate run sat for 43 minutes until its job timeout (2026-11-19). macOS
+        // pipes grow with the write, which is why every local run passed.
+        let dir = scratch_repo("big-tree");
+        std::fs::create_dir_all(dir.join("many")).unwrap();
+        for index in 0..2000 {
+            std::fs::write(
+                dir.join("many").join(format!("f{index}.txt")),
+                format!("{index}{}", "x".repeat(48)),
+            )
+            .unwrap();
+        }
+        git(&dir, &["add", "-A"]);
+        git(
+            &dir,
+            &[
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "user.name=test",
+                "commit",
+                "-qm",
+                "many",
+            ],
+        );
+
+        // A deadlock must fail this test, not wedge the suite: the pack runs on its own thread
+        // with a bounded wait, and a blocked worker dies with the test process.
+        let probe = dir.clone();
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = collect(&probe, Snapshot::Head).map(|tree| tree.files.len());
+            let _ = done.send(outcome);
+        });
+        let files = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("packing 2,000 extra files must finish, not deadlock")
+            .expect("collect");
+        assert!(files >= 2000, "every file is packed: {files}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
