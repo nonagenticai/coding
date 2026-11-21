@@ -42,6 +42,9 @@ All notable changes to this project are documented here. The format follows
   whole job timeout), blob uploads in parallel bounded chunks instead of one serial round trip per
   file, bounded retries honouring `Retry-After`, and a lease retry now reuses the job's branch and
   open PR instead of creating a `-2` branch and a duplicate PR.
+- Runner startup is bounded: a Pod stuck in image pull or scheduling fails fast as retryable
+  infrastructure, a slow pull no longer consumes the job's own budget, and Postgres/Redis startup
+  and sccache stats are bounded by the job deadline and SIGTERM.
 - The worker abandons a job when its lease is lost instead of continuing to duplicate work; a
   cancel landing during the lease sweep is cancelled instead of stranded `queued`; a failed log
   read after a successful Pod is retryable infrastructure, not `runner_failed`.

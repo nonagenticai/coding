@@ -56,7 +56,7 @@ enum Command {
 
 /// The job kinds a check can ask for. All four are executable by the runner today; anything else
 /// would answer `unsupported`, which is a worse way to learn the kind is not implemented.
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum KindArg {
     /// Every check the repository's toolchain runs (the pre-push gate).
     Check,
@@ -243,6 +243,36 @@ fn gates_of(kind: Option<KindArg>, gates: Vec<KindArg>) -> Result<Vec<JobKind>, 
         (Some(kind), true) => Ok(vec![kind.into()]),
         (None, false) => Ok(gates.into_iter().map(JobKind::from).collect()),
         (None, true) => Ok(vec![JobKind::Check]),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gates_resolve_from_kind_or_gates_but_not_both() {
+        assert_eq!(gates_of(None, Vec::new()).unwrap(), vec![JobKind::Check]);
+        assert_eq!(
+            gates_of(Some(KindArg::Lint), Vec::new()).unwrap(),
+            vec![JobKind::Lint]
+        );
+        assert_eq!(
+            gates_of(None, vec![KindArg::Build, KindArg::Test]).unwrap(),
+            vec![JobKind::Build, JobKind::Test]
+        );
+        assert!(gates_of(Some(KindArg::Lint), vec![KindArg::Test]).is_err());
+    }
+
+    #[test]
+    fn the_check_cli_takes_gates_as_one_comma_separated_argument() {
+        let cli = Cli::try_parse_from(["coding", "check", "--gates", "build,test"])
+            .expect("the gates flag parses");
+        let Some(Command::Check(cmd)) = cli.command else {
+            panic!("check subcommand");
+        };
+        assert_eq!(cmd.gates, vec![KindArg::Build, KindArg::Test]);
+        assert!(cmd.kind.is_none());
     }
 }
 
