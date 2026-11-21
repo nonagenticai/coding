@@ -40,6 +40,22 @@ const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 /// a cycle into a computed fact (`$recursive`) rather than a hang.
 const MAX_REF_DEPTH: usize = 32;
 
+/// How many nodes one comparison may expand through `$ref`s, shared by every route and source.
+///
+/// `MAX_REF_DEPTH` bounds a chain, not a tree: two references to the same schema at every level of
+/// a 31-level document expand to 2^31 nodes, which is a CPU and memory bomb inside a 2 GiB Pod.
+/// The budget bounds total work instead. 2 M nodes is far above the largest projected operation in
+/// the estate and far below what a diamond needs, so a real document never meets it and a hostile
+/// one stops with a named `unreadable` route rather than an OOM.
+const MAX_CANONICAL_NODES: usize = 2_000_000;
+
+/// How many differences one route reports. Past this the verdict is already "differs"; the report
+/// only has to carry enough to act on.
+const MAX_DIFFERENCES_PER_ROUTE: usize = 64;
+
+/// The most target-only routes a report lists. The verdict never depends on a listed extra.
+const MAX_EXTRA_ROUTES: usize = 256;
+
 /// The whole report stays inside the result-line budget (`RESULT_LINE_BUDGET` is 192 KiB, and the
 /// failing checks may carry 32 KiB tails of their own); `bounded_line` can only drop
 /// `checks[].output_tail`, so the cap lives here, at construction.
@@ -528,6 +544,16 @@ fn failed(report: Report, errors: Vec<String>) -> Comparison {
 // verdict are built together, and splitting them would invite the three drifting apart.
 #[allow(clippy::too_many_lines)]
 fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
+    compare_with_budget(spec, loaded, MAX_CANONICAL_NODES)
+}
+
+/// [`compare`] with an explicit expansion budget. The production constant is generous enough
+/// that no test can reach it without allocating what it is meant to prevent, so the budget is a
+/// parameter: a test proves the *mechanism* with a small one.
+// reason: one linear route loop is where the counts, the failed flag and the truncation flag stay
+// consistent; a helper per branch would spread that state across four call sites.
+#[allow(clippy::too_many_lines)]
+fn compare_with_budget(spec: &ParitySpec, loaded: &[Loaded], node_budget: usize) -> Comparison {
     let mode = mode_of(spec);
     let Some(target) = loaded.iter().find(|source| source.name == spec.target) else {
         return failed(
@@ -569,7 +595,12 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
 
     let mut counts = Counts::default();
     let mut routes = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
+    // The strings behind a failure were never read: only whether any route failed. A bool says
+    // the same thing without allocating one string per missing, undeclared or differing route.
+    let mut failed = false;
+    let mut truncated = false;
+    // One budget for the whole comparison, not one per route: the bound is on total work.
+    let mut budget = node_budget;
 
     for route in &route_set {
         counts.routes += 1;
@@ -580,10 +611,7 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
             .collect();
         let Some(target_operation) = target.operations.get(route) else {
             counts.missing += 1;
-            failures.push(format!(
-                "{} {} is missing from the target",
-                route.method, route.path
-            ));
+            failed = true;
             routes.push(RouteReport {
                 method: route.method.clone(),
                 path: route.path.clone(),
@@ -596,10 +624,7 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
         };
         if against.is_empty() {
             counts.missing += 1;
-            failures.push(format!(
-                "{} {} is not declared by any source",
-                route.method, route.path
-            ));
+            failed = true;
             routes.push(RouteReport {
                 method: route.method.clone(),
                 path: route.path.clone(),
@@ -610,7 +635,7 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
             });
             continue;
         }
-        let target_projection = project(&target.document, target_operation);
+        let target_projection = project(&target.document, target_operation, &mut budget);
         let mut differences = Vec::new();
         let mut error: Option<String> = None;
         match target_projection {
@@ -621,14 +646,26 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
             }
             Ok(target_projected) => {
                 for origin in &against {
+                    if differences.len() >= MAX_DIFFERENCES_PER_ROUTE {
+                        truncated = true;
+                        break;
+                    }
                     let Some(operation) = origin.operations.get(route) else {
                         continue;
                     };
-                    match project(&origin.document, operation) {
+                    match project(&origin.document, operation, &mut budget) {
                         Ok(projected) => {
-                            let mut found = Vec::new();
-                            diff(&projected, &target_projected, "", &origin.name, &mut found);
-                            differences.extend(found);
+                            diff(
+                                &projected,
+                                &target_projected,
+                                "",
+                                &origin.name,
+                                &mut differences,
+                                MAX_DIFFERENCES_PER_ROUTE,
+                            );
+                            if differences.len() >= MAX_DIFFERENCES_PER_ROUTE {
+                                truncated = true;
+                            }
                         }
                         Err(reason) => {
                             error = Some(format!(
@@ -651,7 +688,7 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
             RouteStatus::Equal => counts.equal += 1,
             RouteStatus::Differ | RouteStatus::Unreadable => {
                 counts.differ += 1;
-                failures.push(format!("{} {} differs", route.method, route.path));
+                failed = true;
             }
             _ => {}
         }
@@ -668,7 +705,7 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
     // Routes the target declares outside the compared set. In slice mode these are the seed's
     // "a route the slice did not name appearing in the target" and fail; in union mode the
     // criterion is one-directional, so they are reported and do not judge.
-    let extra: Vec<RouteRef> = target
+    let mut extra: Vec<RouteRef> = target
         .operations
         .keys()
         .filter(|route| !route_set.contains(*route))
@@ -677,14 +714,13 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
     counts.extra = extra.len();
     let slice_extras = mode == Mode::Slice && !extra.is_empty();
     if slice_extras {
-        for route in &extra {
-            failures.push(format!(
-                "{} {} is declared by the target but not named by the slice",
-                route.method, route.path
-            ));
-            // Counted once in `extra`; a named-set route report is not added for it, so the
-            // counts stay disjoint (a route cannot be both in the set and extra).
-        }
+        // Counted once in `extra`; a named-set route report is not added for it, so the counts
+        // stay disjoint (a route cannot be both in the set and extra).
+        failed = true;
+    }
+    if extra.len() > MAX_EXTRA_ROUTES {
+        extra.truncate(MAX_EXTRA_ROUTES);
+        truncated = true;
     }
 
     let report = Report {
@@ -695,12 +731,9 @@ fn compare(spec: &ParitySpec, loaded: &[Loaded]) -> Comparison {
         routes,
         extra,
         errors: Vec::new(),
-        truncated: false,
+        truncated,
     };
-    Comparison {
-        report,
-        failed: !failures.is_empty(),
-    }
+    Comparison { report, failed }
 }
 
 /// Load one source's document and extract its operations.
@@ -812,7 +845,7 @@ fn resolve_pointer<'a>(document: &'a Value, pointer: &str) -> Result<&'a Value, 
 ///
 /// Annotations are dropped here (and in [`canonical`]); everything else is compared verbatim, so
 /// "differing in one field" is reported at that field's pointer.
-fn project(document: &Value, operation: &Operation) -> Result<Value, String> {
+fn project(document: &Value, operation: &Operation, budget: &mut usize) -> Result<Value, String> {
     let mut parameters = Map::new();
     let operation_parameters = operation
         .operation
@@ -824,7 +857,7 @@ fn project(document: &Value, operation: &Operation) -> Result<Value, String> {
             continue;
         };
         for item in items {
-            let canonical = canonical(document, item, &mut Vec::new())?;
+            let canonical = canonical(document, item, &mut Vec::new(), budget)?;
             let Some(object) = canonical.as_object() else {
                 return Err("a parameter is not an object".to_owned());
             };
@@ -839,7 +872,7 @@ fn project(document: &Value, operation: &Operation) -> Result<Value, String> {
     }
     let request_body = match operation.operation.get("requestBody") {
         Some(body) => {
-            let canonical = canonical(document, body, &mut Vec::new())?;
+            let canonical = canonical(document, body, &mut Vec::new(), budget)?;
             let Some(object) = canonical.as_object() else {
                 return Err("requestBody is not an object".to_owned());
             };
@@ -852,7 +885,7 @@ fn project(document: &Value, operation: &Operation) -> Result<Value, String> {
     };
     let mut responses = Map::new();
     if let Some(responses_object) = operation.operation.get("responses") {
-        let canonical = canonical(document, responses_object, &mut Vec::new())?;
+        let canonical = canonical(document, responses_object, &mut Vec::new(), budget)?;
         let Some(map) = canonical.as_object() else {
             return Err("responses is not an object".to_owned());
         };
@@ -903,7 +936,22 @@ fn content(object: &Map<String, Value>) -> Result<Value, String> {
 
 /// Resolve local `$ref`s and drop annotative keys. A reference already being unwound becomes
 /// `{"$recursive": "<pointer>"}`, so a recursive schema compares equal to an identical one.
-fn canonical(document: &Value, node: &Value, stack: &mut Vec<String>) -> Result<Value, String> {
+///
+/// `budget` bounds the total number of nodes one comparison may expand. A 31-level diamond of
+/// two references per level is 2^31 nodes under plain recursion; the budget turns that into a
+/// named error on the route instead of an OOM inside the Pod.
+fn canonical(
+    document: &Value,
+    node: &Value,
+    stack: &mut Vec<String>,
+    budget: &mut usize,
+) -> Result<Value, String> {
+    if *budget == 0 {
+        return Err(format!(
+            "$ref expansion exceeds the {MAX_CANONICAL_NODES}-node comparison budget"
+        ));
+    }
+    *budget -= 1;
     if let Value::Object(map) = node
         && let Some(Value::String(pointer)) = map.get("$ref")
     {
@@ -917,9 +965,35 @@ fn canonical(document: &Value, node: &Value, stack: &mut Vec<String>) -> Result<
         }
         let target = resolve_pointer(document, pointer)?;
         stack.push(pointer.clone());
-        let resolved = canonical(document, target, stack);
+        let resolved = canonical(document, target, stack, budget);
         stack.pop();
-        return resolved;
+        let resolved = resolved?;
+        // OpenAPI 3.1 allows a `$ref` to carry siblings (3.0 ignored them). Dropping them would
+        // compare two different schemas as equal, so they are overlaid on the resolved target.
+        let mut siblings = map
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() != "$ref"
+                    && !ANNOTATIVE.contains(&key.as_str())
+                    && !key.starts_with("x-")
+            })
+            .peekable();
+        if siblings.peek().is_none() {
+            return Ok(resolved);
+        }
+        let Value::Object(mut out) = resolved else {
+            // A non-object target cannot carry object siblings; the target is the schema.
+            return Ok(resolved);
+        };
+        for (key, value) in siblings {
+            let child = if is_order_free(key) {
+                sorted(value)
+            } else {
+                value.clone()
+            };
+            out.insert(key.clone(), canonical(document, &child, stack, budget)?);
+        }
+        return Ok(Value::Object(fold_nullable(out)));
     }
     match node {
         Value::Object(map) => {
@@ -933,14 +1007,14 @@ fn canonical(document: &Value, node: &Value, stack: &mut Vec<String>) -> Result<
                 } else {
                     value.clone()
                 };
-                out.insert(key.clone(), canonical(document, &child, stack)?);
+                out.insert(key.clone(), canonical(document, &child, stack, budget)?);
             }
             Ok(Value::Object(fold_nullable(out)))
         }
         Value::Array(items) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                out.push(canonical(document, item, stack)?);
+                out.push(canonical(document, item, stack, budget)?);
             }
             Ok(Value::Array(out))
         }
@@ -1034,7 +1108,18 @@ fn sorted(value: &Value) -> Value {
 
 /// Compute the differences between an origin's projection and the target's, in a deterministic
 /// order. Empty means equal.
-fn diff(expected: &Value, actual: &Value, pointer: &str, source: &str, out: &mut Vec<Difference>) {
+fn diff(
+    expected: &Value,
+    actual: &Value,
+    pointer: &str,
+    source: &str,
+    out: &mut Vec<Difference>,
+    limit: usize,
+) {
+    // The verdict is already "differs" at the limit; more entries only grow the report.
+    if out.len() >= limit {
+        return;
+    }
     match (expected, actual) {
         (Value::Object(expected), Value::Object(actual)) => {
             let keys: BTreeSet<&String> = expected.keys().chain(actual.keys()).collect();
@@ -1042,7 +1127,7 @@ fn diff(expected: &Value, actual: &Value, pointer: &str, source: &str, out: &mut
                 let child = format!("{pointer}/{}", escape(key));
                 match (expected.get(key), actual.get(key)) {
                     (Some(expected), Some(actual)) => {
-                        diff(expected, actual, &child, source, out);
+                        diff(expected, actual, &child, source, out, limit);
                     }
                     (Some(expected), None) => out.push(Difference {
                         source: source.to_owned(),
@@ -1070,7 +1155,14 @@ fn diff(expected: &Value, actual: &Value, pointer: &str, source: &str, out: &mut
         }
         (Value::Array(expected), Value::Array(actual)) => {
             for (index, (expected, actual)) in expected.iter().zip(actual).enumerate() {
-                diff(expected, actual, &format!("{pointer}/{index}"), source, out);
+                diff(
+                    expected,
+                    actual,
+                    &format!("{pointer}/{index}"),
+                    source,
+                    out,
+                    limit,
+                );
             }
         }
         _ => {
@@ -1554,5 +1646,168 @@ mod tests {
         dropped.drop_entries();
         assert!(dropped.routes.is_empty());
         assert_eq!(dropped.counts.routes, 2);
+    }
+
+    #[test]
+    fn a_ref_diamond_is_unreadable_not_an_oom() {
+        // Two references to the next schema at every level. Plain recursion is 2^levels nodes;
+        // the budget must stop it and report it, not exhaust the Pod.
+        let levels = 12;
+        let mut schemas = serde_json::Map::new();
+        for level in 0..levels {
+            let next = format!("#/components/schemas/S{}", level + 1);
+            schemas.insert(
+                format!("S{level}"),
+                json!({"oneOf": [{"$ref": next.clone()}, {"$ref": next}]}),
+            );
+        }
+        schemas.insert(format!("S{levels}"), json!({"type": "string"}));
+        let document = json!({
+            "openapi": "3.1.0",
+            "paths": {"/api/jobs": {"get": {"responses": {"200": {"description": "ok",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/S0"}}}}}}}},
+            "components": {"schemas": schemas},
+        });
+
+        let comparison = compare_with_budget(
+            &one_route(),
+            &[loaded("origin", origin()), loaded("target", document)],
+            256,
+        );
+        assert!(!comparison.passed());
+        let route = &comparison.report.routes[0];
+        assert_eq!(route.status, RouteStatus::Unreadable);
+        assert!(
+            route
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("comparison budget"),
+            "{:?}",
+            route.error
+        );
+    }
+
+    #[test]
+    fn a_ref_sibling_is_compared_not_dropped() {
+        // OpenAPI 3.1 allows `{"$ref": X, "minimum": 1}`. Dropping the sibling would call two
+        // different schemas equal.
+        let document = |schema: Value| {
+            json!({
+                "openapi": "3.1.0",
+                "paths": {
+                    "/api/jobs": {
+                        "get": {
+                            "responses": {
+                                "200": {
+                                    "description": "ok",
+                                    "content": {"application/json": {"schema": schema}},
+                                }
+                            }
+                        }
+                    }
+                },
+                "components": {"schemas": {"Limit": {"type": "integer"}}},
+            })
+        };
+        let same = document(json!({"$ref": "#/components/schemas/Limit", "minimum": 1}));
+        let other = document(json!({"$ref": "#/components/schemas/Limit", "minimum": 2}));
+        let equal = compare(
+            &one_route(),
+            &[loaded("origin", same.clone()), loaded("target", same)],
+        );
+        assert!(equal.passed(), "{:?}", equal.report);
+
+        let differ = compare(
+            &one_route(),
+            &[
+                loaded(
+                    "origin",
+                    document(json!({"$ref": "#/components/schemas/Limit", "minimum": 1})),
+                ),
+                loaded("target", other),
+            ],
+        );
+        assert!(!differ.passed());
+        assert_eq!(differ.report.routes[0].status, RouteStatus::Differ);
+        assert!(
+            differ.report.routes[0]
+                .differences
+                .iter()
+                .any(|difference| difference.pointer.contains("minimum")),
+            "{:?}",
+            differ.report.routes[0].differences
+        );
+    }
+
+    #[test]
+    fn a_ref_sibling_annotation_stays_ignored() {
+        // `description` is annotative; carrying it beside a `$ref` must not make a document
+        // different from the same schema without it.
+        let document = |description: Option<&str>| {
+            let mut schema = json!({"$ref": "#/components/schemas/Limit"});
+            if let Some(description) = description {
+                schema["description"] = json!(description);
+            }
+            json!({
+                "openapi": "3.1.0",
+                "paths": {
+                    "/api/jobs": {
+                        "get": {
+                            "responses": {
+                                "200": {
+                                    "description": "ok",
+                                    "content": {"application/json": {"schema": schema}},
+                                }
+                            }
+                        }
+                    }
+                },
+                "components": {"schemas": {"Limit": {"type": "integer"}}},
+            })
+        };
+        let comparison = compare(
+            &one_route(),
+            &[
+                loaded("origin", document(None)),
+                loaded("target", document(Some("an annotation"))),
+            ],
+        );
+        assert!(comparison.passed(), "{:?}", comparison.report);
+    }
+
+    #[test]
+    fn differences_are_capped_but_still_differ() {
+        let document = |marker: &str| {
+            let mut properties = serde_json::Map::new();
+            for index in 0..200 {
+                properties.insert(
+                    format!("p{index:03}"),
+                    json!({"type": "string", "pattern": format!("{marker}{index}")}),
+                );
+            }
+            json!({
+                "openapi": "3.1.0",
+                "paths": {"/api/jobs": {"get": {"responses": {"200": {"description": "ok",
+                    "content": {"application/json": {"schema": {
+                        "type": "object", "properties": properties
+                    }}}}}}}},
+            })
+        };
+        let comparison = compare(
+            &one_route(),
+            &[
+                loaded("origin", document("a")),
+                loaded("target", document("b")),
+            ],
+        );
+        assert!(!comparison.passed());
+        let route = &comparison.report.routes[0];
+        assert_eq!(route.status, RouteStatus::Differ);
+        assert_eq!(route.differences.len(), MAX_DIFFERENCES_PER_ROUTE);
+        assert!(
+            comparison.report.truncated,
+            "a report that hit the differences cap says so"
+        );
     }
 }
