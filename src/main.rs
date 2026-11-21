@@ -246,36 +246,6 @@ fn gates_of(kind: Option<KindArg>, gates: Vec<KindArg>) -> Result<Vec<JobKind>, 
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gates_resolve_from_kind_or_gates_but_not_both() {
-        assert_eq!(gates_of(None, Vec::new()).unwrap(), vec![JobKind::Check]);
-        assert_eq!(
-            gates_of(Some(KindArg::Lint), Vec::new()).unwrap(),
-            vec![JobKind::Lint]
-        );
-        assert_eq!(
-            gates_of(None, vec![KindArg::Build, KindArg::Test]).unwrap(),
-            vec![JobKind::Build, JobKind::Test]
-        );
-        assert!(gates_of(Some(KindArg::Lint), vec![KindArg::Test]).is_err());
-    }
-
-    #[test]
-    fn the_check_cli_takes_gates_as_one_comma_separated_argument() {
-        let cli = Cli::try_parse_from(["coding", "check", "--gates", "build,test"])
-            .expect("the gates flag parses");
-        let Some(Command::Check(cmd)) = cli.command else {
-            panic!("check subcommand");
-        };
-        assert_eq!(cmd.gates, vec![KindArg::Build, KindArg::Test]);
-        assert!(cmd.kind.is_none());
-    }
-}
-
 fn run_hook(cmd: HookCmd) -> ExitCode {
     let dir = match std::env::current_dir() {
         Ok(dir) => dir,
@@ -383,4 +353,33 @@ async fn shutdown_signal() {
         () = term => {},
     }
     tracing::info!("shutdown signal received");
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gates_resolve_from_kind_or_gates_but_not_both() {
+        assert_eq!(gates_of(None, Vec::new()).unwrap(), vec![JobKind::Check]);
+        assert_eq!(
+            gates_of(Some(KindArg::Lint), Vec::new()).unwrap(),
+            vec![JobKind::Lint]
+        );
+        assert_eq!(
+            gates_of(None, vec![KindArg::Build, KindArg::Test]).unwrap(),
+            vec![JobKind::Build, JobKind::Test]
+        );
+        assert!(gates_of(Some(KindArg::Lint), vec![KindArg::Test]).is_err());
+    }
+
+    #[test]
+    fn the_check_cli_takes_gates_as_one_comma_separated_argument() {
+        let cli = Cli::try_parse_from(["coding", "check", "--gates", "build,test"])
+            .expect("the gates flag parses");
+        let Some(Command::Check(cmd)) = cli.command else {
+            panic!("check subcommand");
+        };
+        assert_eq!(cmd.gates, vec![KindArg::Build, KindArg::Test]);
+        assert!(cmd.kind.is_none());
+    }
 }
