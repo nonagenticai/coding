@@ -21,7 +21,7 @@ pub mod pack;
 
 use std::fmt;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -195,7 +195,7 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     // 1. Upload the archive. The first request leaves a laptop moments after an `ssh -L` tunnel
     //    starts, and a tunnel is not ready the instant it prints — one attempt would report
     //    "cannot reach the app" for a tunnel that is fine a second later.
-    let upload = send_with_retry(|| {
+    let upload = send_with_retry(RetryPolicy::Writes, || {
         authorize(
             client
                 .post(format!("{base}/api/sources"))
@@ -227,8 +227,11 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
         "kind": args.kind.as_str(),
         "input": input,
         "timeout_seconds": args.timeout_seconds,
+        // A retried POST after a lost response must return THIS invocation's job, not create a
+        // second Pod; a fresh invocation must never be handed the previous run's finished job.
+        "idempotency_key": invocation_key(&sha256, args.kind),
     });
-    let created = send_with_retry(|| {
+    let created = send_with_retry(RetryPolicy::Writes, || {
         authorize(
             client
                 .post(format!("{base}/api/jobs"))
@@ -350,16 +353,39 @@ const TRANSPORT_ATTEMPTS: u32 = 3;
 /// The first wait between those attempts; each later wait doubles.
 const TRANSPORT_BACKOFF: Duration = Duration::from_millis(500);
 
+/// What a transport failure is allowed to mean for this request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPolicy {
+    /// A GET: the server changed nothing, so any failed attempt may be repeated.
+    Reads,
+    /// A POST: only a failure that happened BEFORE the connection was established is safe to
+    /// repeat. A timeout or a reset may arrive after the server stored the archive or created the
+    /// job, and a blind retry would upload twice or run two Pods; the client would then poll only
+    /// the id it happens to receive.
+    Writes,
+}
+
+impl RetryPolicy {
+    fn allows(self, error: &reqwest::Error) -> bool {
+        match self {
+            Self::Reads => true,
+            Self::Writes => error.is_connect(),
+        }
+    }
+}
+
 /// Send a request, retrying a **transport** failure a couple of times. A refusal or an error
-/// status is the app answering, and is never retried here.
+/// status is the app answering, and is never retried here. A write is retried only when the
+/// connection itself failed (`RetryPolicy::Writes`): see the enum for why.
 async fn send_with_retry(
+    policy: RetryPolicy,
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, ClientError> {
     let mut attempt = 1;
     loop {
         match build().send().await {
             Ok(response) => return Ok(response),
-            Err(error) if attempt < TRANSPORT_ATTEMPTS => {
+            Err(error) if policy.allows(&error) && attempt < TRANSPORT_ATTEMPTS => {
                 let wait = TRANSPORT_BACKOFF * 2u32.pow(attempt - 1);
                 eprintln!(
                     "coding check: {error} — attempt {attempt}/{TRANSPORT_ATTEMPTS}, retrying in {}ms",
@@ -373,6 +399,22 @@ async fn send_with_retry(
             }
         }
     }
+}
+
+/// A job idempotency key that is stable across the retries of ONE invocation and different for
+/// every invocation.
+///
+/// It must not be derived from the tree alone: the pre-push hook runs the same snapshot twice a
+/// day, and a tree-derived key would hand the second run the first run's finished job. It must not
+/// be random per attempt either, or a retried POST would create a second job. Time + pid + the
+/// archive digest gives one key per process run, stable while that run retries.
+fn invocation_key(sha256: &str, kind: JobKind) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    crate::source_archive::sha256_hex(
+        format!("{}:{sha256}:{nanos}:{}", kind.as_str(), std::process::id()).as_bytes(),
+    )
 }
 
 /// Read a response as JSON, mapping a refusal to the right exit class.
@@ -869,6 +911,72 @@ mod tests {
                 .headers()
                 .get(reqwest::header::AUTHORIZATION)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn an_invocation_key_is_unique_per_call_and_never_the_tree_alone() {
+        let first = invocation_key("abc", JobKind::Check);
+        let second = invocation_key("abc", JobKind::Check);
+        assert_ne!(
+            first, second,
+            "two runs on the same tree must not share a job"
+        );
+        assert_eq!(first.len(), 64, "sha256 hex");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A server that accepts connections and never answers, counting them.
+    async fn stalling_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let address = listener.local_addr().expect("local addr");
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&accepts);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Keep the connection open so the client, not the peer, ends the attempt.
+                held.push(socket);
+            }
+        });
+        (format!("http://{address}/api/sources"), accepts)
+    }
+
+    #[tokio::test]
+    async fn a_write_is_not_retried_after_the_connection_was_made() {
+        let (url, accepts) = stalling_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let result = send_with_retry(RetryPolicy::Writes, || client.post(&url)).await;
+        assert!(result.is_err(), "a timed-out write is infrastructure");
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a write the server may already have applied must not be sent twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_is_retried_after_the_connection_was_made() {
+        let (url, accepts) = stalling_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let result = send_with_retry(RetryPolicy::Reads, || client.get(&url)).await;
+        assert!(result.is_err());
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            usize::try_from(TRANSPORT_ATTEMPTS).unwrap(),
+            "a read changes nothing and may be retried"
         );
     }
 }
