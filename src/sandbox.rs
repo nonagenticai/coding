@@ -574,6 +574,10 @@ pub enum PodState {
     Succeeded { exit_code: Option<i32> },
     /// The Pod failed; `reason` comes from the Pod or its terminated container.
     Failed { reason: String },
+    /// The Pod cannot make progress: a container waiting on an image or config reason that does
+    /// not resolve, or a Pod the scheduler refuses. Distinct from `Failed` because nothing about
+    /// the job's code ran, so the job's error is retryable infrastructure.
+    Stuck { reason: String },
     /// The Pod no longer exists (reaped, deleted, or never created).
     Gone,
 }
@@ -941,7 +945,10 @@ impl Sandbox {
                 reason: failure_reason(status),
             },
             Some(STATE_RUNNING) => PodState::Running,
-            _ => PodState::Pending,
+            _ => match waiting_reason(status) {
+                Some(reason) => PodState::Stuck { reason },
+                None => PodState::Pending,
+            },
         })
     }
 
@@ -1201,6 +1208,60 @@ fn success_exit_code(status: &Value) -> Option<i32> {
 
 /// The reason a failed Pod should report: the Pod's own reason first, then the first
 /// terminated container's reason and exit code.
+/// Why a Pod that is neither Running nor terminal cannot start, if the reason is one that will
+/// not resolve on its own.
+///
+/// `ImagePullBackOff` is included on purpose: the runner image is pinned by digest, so a registry
+/// that cannot serve it is a configuration or availability problem, not a slow pull to wait out.
+/// A plain `ContainerCreating` is not a reason and stays `Pending`.
+fn waiting_reason(status: &Value) -> Option<String> {
+    if let Some(containers) = status["containerStatuses"].as_array() {
+        for container in containers {
+            let waiting = &container["state"]["waiting"];
+            let Some(reason) = waiting["reason"]
+                .as_str()
+                .filter(|reason| !reason.is_empty())
+            else {
+                continue;
+            };
+            if !matches!(
+                reason,
+                "ErrImagePull"
+                    | "ImagePullBackOff"
+                    | "InvalidImageName"
+                    | "CreateContainerConfigError"
+                    | "CreateContainerError"
+                    | "RunContainerError"
+                    | "CrashLoopBackOff"
+            ) {
+                continue;
+            }
+            let message = waiting["message"].as_str().unwrap_or_default();
+            return Some(if message.is_empty() {
+                reason.to_owned()
+            } else {
+                format!("{reason}: {message}")
+            });
+        }
+    }
+    if let Some(conditions) = status["conditions"].as_array() {
+        for condition in conditions {
+            if condition["type"].as_str() == Some("PodScheduled")
+                && condition["status"].as_str() == Some("False")
+                && condition["reason"].as_str() == Some("Unschedulable")
+            {
+                let message = condition["message"].as_str().unwrap_or_default();
+                return Some(if message.is_empty() {
+                    "Unschedulable".to_owned()
+                } else {
+                    format!("Unschedulable: {message}")
+                });
+            }
+        }
+    }
+    None
+}
+
 fn failure_reason(status: &Value) -> String {
     if let Some(reason) = status["reason"]
         .as_str()

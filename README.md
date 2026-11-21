@@ -21,6 +21,8 @@ CODING_URL=http://127.0.0.1:8687 coding check --profile python  # force a toolch
 CODING_URL=http://127.0.0.1:8687 coding check --dry-run     # show what would be sent
 CODING_URL=http://127.0.0.1:8687 coding check --snapshot index   # what a commit would record
 CODING_URL=http://127.0.0.1:8687 coding check --snapshot head    # what a push sends
+CODING_URL=http://127.0.0.1:8687 coding check --gates build,test --snapshot head
+                                                        # the pre-push gate: one upload, two jobs
 coding hook install                                     # pre-push: build then test on HEAD
 coding hook install --hook pre-commit --kind lint       # commit: lint on the index
 git config coding.url http://127.0.0.1:8687             # what the hook reads
@@ -70,8 +72,9 @@ During polling, a `500`/`502`/`503`/`504` from a rolling deployment is retried f
 persistent one still exits 3.
 
 The hooks are snapshot- and gate-aware: the pre-push hook runs `build` and then `test` against
-**HEAD** as two separate requests, so a build failure is reported as a build failure and the test
-gate is marked not run; the pre-commit hook runs its `--kind` (default `lint`) against the
+**HEAD** as two gates in **one** invocation — the snapshot is packed and uploaded once, then both
+jobs reference that one source. A build failure stops before the test gate and the client prints
+it as not run; the pre-commit hook runs its `--kind` (default `lint`) against the
 **index**, i.e. exactly the commit.
 
 Measured latency (one cold Pod): a tiny crate is 12–43 s end to end; a medium Rust workspace is

@@ -1,7 +1,7 @@
 //! Source uploads: how a working tree that does not fit in a 64 KiB Pod spec reaches a runner.
 //!
 //! * `POST /api/sources`   — store one gzip tar of a working tree, tenant-scoped, and return its
-//!   id. The body is read here rather than through an extractor, so the 16 MiB cap is enforced by
+//!   id. The body is read here rather than through an extractor, so the 32 MiB cap is enforced by
 //!   this handler instead of axum's 2 MiB default.
 //! * `GET /api/sources/{id}/blob` — the archive, for a Pod that holds the capability token the
 //!   worker minted. No tenant header: the token *is* the capability, and it is the only thing
@@ -26,11 +26,15 @@ use crate::store;
 use crate::tenant::{TenantHeader, TenantId};
 
 /// How many uploads one process buffers at once. The handler holds the compressed archive in
-/// memory to hash it, validate it and store it, so N concurrent uploads are N × 16 MiB.
+/// memory to hash it, validate it and store it, so N concurrent uploads are N × 32 MiB.
 const MAX_CONCURRENT_UPLOADS: usize = 2;
 /// How long an upload waits for a slot before the app says "busy". Waiting is right: the slot is
-/// a memory guard, not a refusal, and a caller that is told to retry would only send 16 MiB again.
+/// a memory guard, not a refusal, and a caller that is told to retry would only send 32 MiB again.
 const UPLOAD_SLOT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long the body may take to arrive once the slot is held. A slot is a memory guard, so a
+/// client that connects and trickles must not hold one forever; 180 s still lets a 32 MiB archive
+/// arrive over a ~1.5 Mbit/s link, and the client's own upload timeout is longer.
+const UPLOAD_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
 
 /// The process-wide upload gate. A `OnceLock` because the limit is a property of the process's
 /// memory, not of a request or of the database handle.
@@ -89,7 +93,19 @@ pub async fn create_source(
     };
 
     let limit = source_archive::MAX_COMPRESSED_BYTES;
-    let Ok(body) = axum::body::to_bytes(request.into_body(), limit + 1).await else {
+    let read = tokio::time::timeout(
+        UPLOAD_READ_TIMEOUT,
+        axum::body::to_bytes(request.into_body(), limit + 1),
+    )
+    .await;
+    let Ok(read) = read else {
+        return AppError::RequestTimeout(format!(
+            "the archive did not arrive within {}s",
+            UPLOAD_READ_TIMEOUT.as_secs()
+        ))
+        .into_response();
+    };
+    let Ok(body) = read else {
         return AppError::PayloadTooLarge(format!(
             "the archive could not be read in full, or is over the {limit}-byte cap"
         ))
@@ -103,11 +119,25 @@ pub async fn create_source(
         .into_response();
     }
 
-    let manifest = match source_archive::validate(&body) {
-        Ok(manifest) => manifest,
-        Err(error) => return AppError::BadRequest(error.to_string()).into_response(),
+    // Validation inflates the archive (up to 128 MiB) and hashes it: pure CPU that must not run
+    // on a Tokio worker. Two such uploads on one 2-vCPU API pod would otherwise stall every
+    // request, including the k8s probes, for the duration of the inflate.
+    let validating = body.clone();
+    let validated = tokio::task::spawn_blocking(move || {
+        let manifest = source_archive::validate(&validating)?;
+        let sha256 = source_archive::sha256_hex(&validating);
+        Ok::<_, source_archive::ArchiveError>((manifest, sha256))
+    })
+    .await;
+    let (manifest, sha256) = match validated {
+        Ok(Ok(validated)) => validated,
+        Ok(Err(error)) => return AppError::BadRequest(error.to_string()).into_response(),
+        Err(error) => {
+            tracing::error!(error = %error, "the archive validator task failed");
+            return AppError::Unavailable("the archive validator stopped unexpectedly".to_owned())
+                .into_response();
+        }
     };
-    let sha256 = source_archive::sha256_hex(&body);
     let Ok(files) = i32::try_from(manifest.files) else {
         return AppError::BadRequest("the archive carries too many files".to_owned())
             .into_response();

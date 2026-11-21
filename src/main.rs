@@ -56,7 +56,7 @@ enum Command {
 
 /// The job kinds a check can ask for. All four are executable by the runner today; anything else
 /// would answer `unsupported`, which is a worse way to learn the kind is not implemented.
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum KindArg {
     /// Every check the repository's toolchain runs (the pre-push gate).
     Check,
@@ -88,8 +88,14 @@ struct CheckCmd {
     /// The licence bearer token. Falls back to `CODING_TOKEN`, then `git config coding.token`.
     #[arg(long, env = "CODING_TOKEN")]
     token: Option<String>,
-    #[arg(long, value_enum, default_value_t = KindArg::Check)]
-    kind: KindArg,
+    /// One gate kind. Cannot be combined with `--gates`; default `check`.
+    #[arg(long, value_enum)]
+    kind: Option<KindArg>,
+    /// Run several gates against ONE packed and uploaded snapshot, in order (`build,test`).
+    /// This is what the pre-push hook uses: a build failure stops before the test gate, and the
+    /// archive travels once.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    gates: Vec<KindArg>,
     /// The toolchain profile to run. `auto` reads the packed tree: Cargo.toml + Cargo.lock is
     /// rust; pyproject.toml + uv.lock is python.
     #[arg(long, value_enum, default_value_t = client::ProfileArg::Auto)]
@@ -126,7 +132,7 @@ enum HookAction {
         #[arg(long, value_enum, default_value_t = HookName::PrePush)]
         hook: HookName,
         /// The pre-commit job kind (default: lint). The pre-push hook ignores it and runs
-        /// `build` then `test` against HEAD as two separate gates.
+        /// `build` then `test` against HEAD as two gates in one invocation.
         #[arg(long, value_enum)]
         kind: Option<KindArg>,
         /// Replace a hook that coding did not write.
@@ -187,11 +193,18 @@ async fn main() -> ExitCode {
     // terminal, and a log line in the middle of a verdict is noise.
     let command = match command {
         Command::Check(cmd) => {
+            let gates = match gates_of(cmd.kind, cmd.gates) {
+                Ok(gates) => gates,
+                Err(message) => {
+                    eprintln!("coding check: {message}");
+                    return ExitCode::from(client::EXIT_USAGE);
+                }
+            };
             let code = client::check(CheckArgs {
                 url: cmd.url,
                 tenant: cmd.tenant,
                 token: cmd.token,
-                kind: cmd.kind.into(),
+                gates,
                 profile: cmd.profile,
                 snapshot: cmd.snapshot,
                 timeout_seconds: cmd.timeout,
@@ -217,6 +230,19 @@ async fn main() -> ExitCode {
             tracing::error!(error = %e, "startup failed");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Resolve `--kind` / `--gates` into the ordered gate list.
+///
+/// A default cannot say whether the caller typed `--kind`, so `kind` is an `Option` and the two
+/// flags are refused together instead of one silently winning.
+fn gates_of(kind: Option<KindArg>, gates: Vec<KindArg>) -> Result<Vec<JobKind>, String> {
+    match (kind, gates.is_empty()) {
+        (Some(_), false) => Err("pass --kind or --gates, not both".to_owned()),
+        (Some(kind), true) => Ok(vec![kind.into()]),
+        (None, false) => Ok(gates.into_iter().map(JobKind::from).collect()),
+        (None, true) => Ok(vec![JobKind::Check]),
     }
 }
 
@@ -327,4 +353,33 @@ async fn shutdown_signal() {
         () = term => {},
     }
     tracing::info!("shutdown signal received");
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gates_resolve_from_kind_or_gates_but_not_both() {
+        assert_eq!(gates_of(None, Vec::new()).unwrap(), vec![JobKind::Check]);
+        assert_eq!(
+            gates_of(Some(KindArg::Lint), Vec::new()).unwrap(),
+            vec![JobKind::Lint]
+        );
+        assert_eq!(
+            gates_of(None, vec![KindArg::Build, KindArg::Test]).unwrap(),
+            vec![JobKind::Build, JobKind::Test]
+        );
+        assert!(gates_of(Some(KindArg::Lint), vec![KindArg::Test]).is_err());
+    }
+
+    #[test]
+    fn the_check_cli_takes_gates_as_one_comma_separated_argument() {
+        let cli = Cli::try_parse_from(["coding", "check", "--gates", "build,test"])
+            .expect("the gates flag parses");
+        let Some(Command::Check(cmd)) = cli.command else {
+            panic!("check subcommand");
+        };
+        assert_eq!(cmd.gates, vec![KindArg::Build, KindArg::Test]);
+        assert!(cmd.kind.is_none());
+    }
 }

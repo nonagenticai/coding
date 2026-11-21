@@ -155,8 +155,8 @@ exit 0
         HookKind::PrePush => r#"#!/bin/sh
 {MARKER} — installed by `coding hook install`, removed by `coding hook uninstall`.
 # Fails OPEN: only a failed check blocks this push; an unreachable app does not.
-# Checks HEAD — exactly what this push sends — and runs build and test as TWO gates.
-# A build failure blocks and reports the test gate as not run.
+# Checks HEAD — exactly what this push sends — and runs build and test as TWO gates in ONE
+# invocation: the snapshot is packed and uploaded once, and a build failure stops before test.
 cat >/dev/null 2>&1 || true
 if ! command -v coding >/dev/null 2>&1; then
     echo "coding: not on PATH; skipping the quality gate" >&2
@@ -164,27 +164,16 @@ if ! command -v coding >/dev/null 2>&1; then
 fi
 url=$(git config --get coding.url 2>/dev/null || true)
 tenant=$(git config --get coding.tenant 2>/dev/null || true)
-run_gate() {
-    kind=$1
-    set -- check --kind "$kind" --snapshot head
-    if [ -n "$url" ]; then set -- "$@" --url "$url"; fi
-    if [ -n "$tenant" ]; then set -- "$@" --tenant "$tenant"; fi
-    coding "$@"
-    code=$?
-    if [ "$code" -eq 1 ]; then
-        return 1
-    fi
-    if [ "$code" -ne 0 ]; then
-        echo "coding: the $kind gate could not run (exit $code); letting the push through" >&2
-    fi
-    return 0
-}
-if ! run_gate build; then
-    echo "coding: the build gate failed; the test gate did not run" >&2
+set -- check --gates build,test --snapshot head
+if [ -n "$url" ]; then set -- "$@" --url "$url"; fi
+if [ -n "$tenant" ]; then set -- "$@" --tenant "$tenant"; fi
+coding "$@"
+code=$?
+if [ "$code" -eq 1 ]; then
     exit 1
 fi
-if ! run_gate test; then
-    exit 1
+if [ "$code" -ne 0 ]; then
+    echo "coding: the gate could not run (exit $code); letting the push through" >&2
 fi
 exit 0
 "#
@@ -242,8 +231,7 @@ mod tests {
         let path = install(&dir, HookKind::PrePush, JobKind::Check, false).expect("install");
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(written.contains(MARKER));
-        assert!(written.contains("run_gate build"), "{written}");
-        assert!(written.contains("run_gate test"), "{written}");
+        assert!(written.contains("--gates build,test"), "{written}");
         assert!(written.contains("--snapshot head"), "{written}");
         assert!(
             written.contains("coding.url"),
@@ -314,8 +302,7 @@ mod tests {
             r#"#!/bin/sh
 echo "$*" >> "$STUB_LOG"
 case "$*" in
-  *"--kind build"*) exit "${STUB_BUILD_EXIT:-0}" ;;
-  *"--kind test"*) exit "${STUB_TEST_EXIT:-0}" ;;
+  *"--gates build,test"*) exit "${STUB_GATES_EXIT:-0}" ;;
   *) exit "${STUB_EXIT:-0}" ;;
 esac
 "#,
@@ -369,7 +356,7 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn pre_push_runs_build_then_test_on_head() {
+    fn pre_push_runs_both_gates_in_one_invocation() {
         let dir = scratch_repo("push-order");
         let path = install(&dir, HookKind::PrePush, JobKind::Check, false).expect("install");
         git(
@@ -384,35 +371,33 @@ esac
             &dir,
             &stub_dir,
             &log,
-            &[("STUB_BUILD_EXIT", "0"), ("STUB_TEST_EXIT", "0")],
+            &[],
             "refs/heads/main 1234 refs/heads/main 0000\n",
         );
         assert!(output.status.success(), "{output:?}");
         let lines = logged(&log);
-        assert_eq!(lines.len(), 2, "{lines:?}");
-        assert!(
-            lines[0].starts_with("check --kind build --snapshot head"),
-            "{lines:?}"
+        assert_eq!(
+            lines.len(),
+            1,
+            "one invocation packs and uploads once: {lines:?}"
         );
         assert!(
-            lines[1].starts_with("check --kind test --snapshot head"),
+            lines[0].starts_with("check --gates build,test --snapshot head"),
             "{lines:?}"
         );
-        for line in &lines {
-            assert!(line.contains("--url https://example.test/coding"), "{line}");
-            assert!(line.contains("--tenant t1"), "{line}");
-            assert!(
-                !line.contains("SEKRIT"),
-                "the token must never be on argv: {line}"
-            );
-        }
+        assert!(lines[0].contains("--url https://example.test/coding"));
+        assert!(lines[0].contains("--tenant t1"));
+        assert!(
+            !lines[0].contains("SEKRIT"),
+            "the token must never be on argv: {lines:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&stub_dir);
     }
 
     #[cfg(unix)]
     #[test]
-    fn a_build_failure_blocks_and_reports_the_test_as_not_run() {
+    fn a_failed_check_blocks_the_push() {
         let dir = scratch_repo("build-fail");
         let path = install(&dir, HookKind::PrePush, JobKind::Check, false).expect("install");
         let (stub_dir, log) = stub_coding("build-fail");
@@ -421,36 +406,11 @@ esac
             &dir,
             &stub_dir,
             &log,
-            &[("STUB_BUILD_EXIT", "1"), ("STUB_TEST_EXIT", "0")],
+            &[("STUB_GATES_EXIT", "1")],
             "",
         );
         assert_eq!(output.status.code(), Some(1));
-        let lines = logged(&log);
-        assert_eq!(lines.len(), 1, "the test gate must not run: {lines:?}");
-        assert!(lines[0].starts_with("check --kind build"), "{lines:?}");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("test gate did not run"), "{stderr}");
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&stub_dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_test_failure_blocks_after_both_gates_ran() {
-        let dir = scratch_repo("test-fail");
-        let path = install(&dir, HookKind::PrePush, JobKind::Check, false).expect("install");
-        let (stub_dir, log) = stub_coding("test-fail");
-        let output = run_hook(
-            &path,
-            &dir,
-            &stub_dir,
-            &log,
-            &[("STUB_BUILD_EXIT", "0"), ("STUB_TEST_EXIT", "1")],
-            "",
-        );
-        assert_eq!(output.status.code(), Some(1));
-        let lines = logged(&log);
-        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(logged(&log).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&stub_dir);
     }
@@ -467,7 +427,7 @@ esac
                 &dir,
                 &stub_dir,
                 &log,
-                &[("STUB_BUILD_EXIT", "0"), ("STUB_TEST_EXIT", code)],
+                &[("STUB_GATES_EXIT", code)],
                 "",
             );
             assert!(
