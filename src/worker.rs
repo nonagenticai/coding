@@ -966,6 +966,11 @@ mod tests {
             "https://gitlab.com/o/r.git",
             "https://evil.example/github.com/o/r.git",
             "https://github.com.evil.example/o/r.git",
+            // The host-confusion forms: a string check passes these, the parsed URL does not.
+            "https://github.com:443@evil.example/o/r.git",
+            "https://github.com@evil.example/o/r.git",
+            // Cleartext: the token would travel unprotected.
+            "http://github.com/o/r.git",
         ] {
             let claim = claim_with(&json!({"kind": "git", "url": url}));
             let token = git_token(Some(&app), &claim.input["source"])

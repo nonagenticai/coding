@@ -215,18 +215,26 @@ struct Minted {
     token: String,
 }
 
-/// Whether a clone URL names github.com. Only these receive an installation token: the token is
-/// a credential, and the request chooses the URL.
+/// Whether a clone URL names github.com over TLS. Only these receive an installation token: the
+/// token is a credential, and the request chooses the URL.
+///
+/// This parses the URL rather than looking for the string `github.com`, because a string search
+/// is how a credential leaks: `https://github.com:443@evil.example/r.git` starts with the right
+/// characters and sends every byte to `evil.example`. The parsed host must be exactly
+/// `github.com`, the scheme must be `https`, there must be no userinfo, and the port must be the
+/// default — a token is never attached to a URL that another host could receive.
 #[must_use]
 pub fn is_github_url(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    let host = rest.split(['/', ':']).next().unwrap_or_default();
-    host.eq_ignore_ascii_case("github.com")
+    parsed.scheme() == "https"
+        && parsed
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && matches!(parsed.port(), None | Some(443))
 }
 
 /// The `AUTHORIZATION` header value a git client needs for an installation token.
@@ -385,7 +393,7 @@ mod tests {
         for url in [
             "https://github.com/nonagenticai/coding.git",
             "https://github.com/nonagenticai/coding",
-            "http://github.com/o/r",
+            "https://github.com:443/o/r",
             "https://GitHub.com/o/r",
         ] {
             assert!(is_github_url(url), "{url}");
@@ -396,6 +404,16 @@ mod tests {
             "https://evil.example/github.com/o/r",
             "git://github.com/o/r",
             "https://gist.github.com/o/r",
+            // Cleartext: the token would travel unprotected.
+            "http://github.com/o/r",
+            // Userinfo is the host-confusion attack: the real host is after the `@`.
+            "https://github.com:443@evil.example/o/r",
+            "https://github.com@evil.example/o/r",
+            "https://user:pass@github.com/o/r",
+            // A non-default port is not the address GitHub serves the API from.
+            "https://github.com:8443/o/r",
+            // A trailing dot is a different host spelling; refusing it is the safe direction.
+            "https://github.com./o/r",
             "",
         ] {
             assert!(!is_github_url(url), "{url}");
