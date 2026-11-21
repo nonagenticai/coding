@@ -674,3 +674,141 @@ async fn a_panicking_slot_stops_its_heartbeat_and_the_job_is_reclaimed() {
     handle.await.expect("worker task").expect("worker loop");
     db.finish().await;
 }
+
+/// A worker whose lease is short enough to observe a theft in a test.
+fn quick_lease_settings() -> WorkerSettings {
+    WorkerSettings {
+        lease_seconds: 2,
+        heartbeat_interval: Duration::from_millis(100),
+        poll_interval: Duration::from_millis(10),
+        reap_interval: Duration::from_secs(60),
+        pod_deadline_seconds: 900,
+        concurrency: 1,
+    }
+}
+
+#[tokio::test]
+async fn a_lost_lease_drops_the_executor_and_records_no_result() {
+    let db = TestDb::new().await;
+    let ids = enqueue(&db.pool, 1).await;
+    let id = ids[0].clone();
+
+    let started = Arc::new(Notify::new());
+    let dropped = Arc::new(Notify::new());
+    let executor: Box<worker::JobExecutor> = {
+        let started = Arc::clone(&started);
+        let dropped = Arc::clone(&dropped);
+        Box::new(move |_claim: JobClaim| -> ExecutorFuture {
+            let started = Arc::clone(&started);
+            let dropped = Arc::clone(&dropped);
+            Box::pin(async move {
+                // A Drop guard: the future is not completing, so only cancellation can drop it.
+                struct OnDrop(Arc<Notify>);
+                impl Drop for OnDrop {
+                    fn drop(&mut self) {
+                        self.0.notify_one();
+                    }
+                }
+                let _guard = OnDrop(dropped);
+                started.notify_one();
+                // Never resolves: only dropping the future can end this executor.
+                std::future::pending::<Result<Value, JobError>>().await
+            })
+        })
+    };
+
+    let (handle, stop) = spawn_worker(&db.pool, "w-lease", quick_lease_settings(), executor);
+    started.notified().await;
+
+    // Someone else now owns the row; the next heartbeat must notice and stop this executor.
+    sqlx::query("UPDATE jobs SET lease_owner = 'thief/1' WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&db.pool)
+        .await
+        .expect("steal the lease");
+
+    tokio::time::timeout(Duration::from_secs(5), dropped.notified())
+        .await
+        .expect("the executor was not dropped after the lease was lost");
+
+    let row: (String, String, Option<Value>) =
+        sqlx::query_as("SELECT status, lease_owner, result FROM jobs WHERE id = $1::uuid")
+            .bind(&id)
+            .fetch_one(&db.pool)
+            .await
+            .expect("read stolen job");
+    assert_eq!(
+        row.0, "running",
+        "the old worker must not finish a job it lost"
+    );
+    assert_eq!(row.1, "thief/1");
+    assert!(row.2.is_none());
+
+    let _ = stop.send(());
+    handle.await.expect("worker task").expect("worker loop");
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn reap_expired_never_requeues_a_cancel_requested_row() {
+    let db = TestDb::new().await;
+    let ids = enqueue(&db.pool, 1).await;
+    let id = ids[0].clone();
+
+    // A running claim whose lease lapsed and whose cancel arrived at the same moment.
+    sqlx::query(
+        "UPDATE jobs SET status = 'running', lease_owner = 'w/1', attempts = 1,
+             lease_expires_at = now() - interval '1 second', cancel_requested = true
+         WHERE id = $1::uuid",
+    )
+    .bind(&id)
+    .execute(&db.pool)
+    .await
+    .expect("stage a cancelled, expired claim");
+
+    let (requeued, failed) = store::reap_expired(&db.pool).await.expect("reap leases");
+    assert_eq!(
+        (requeued, failed),
+        (0, 0),
+        "the lease sweep must leave a cancel-requested row to the cancel sweep"
+    );
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM jobs WHERE id = $1::uuid")
+        .bind(&id)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read staged job");
+    assert_eq!(status, "running");
+
+    let cancelled = store::reap_cancelled(&db.pool).await.expect("reap cancels");
+    assert_eq!(cancelled, 1);
+    let claim = store::claim_job(&db.pool, "w-2", 60)
+        .await
+        .expect("claim a cancelled row");
+    assert!(claim.is_none(), "a cancelled row must never be claimed");
+
+    db.finish().await;
+}
+
+#[tokio::test]
+async fn a_queued_cancel_requested_row_is_healed_to_cancelled() {
+    let db = TestDb::new().await;
+    let ids = enqueue(&db.pool, 1).await;
+    let id = ids[0].clone();
+
+    // The state an older build could leave behind: requeued with the cancel flag still set.
+    // `claim_job` skips it forever, so only the cancel sweep can end it.
+    sqlx::query("UPDATE jobs SET cancel_requested = true WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&db.pool)
+        .await
+        .expect("strand a queued cancelled job");
+
+    let cancelled = store::reap_cancelled(&db.pool).await.expect("reap cancels");
+    assert_eq!(cancelled, 1);
+    let claim = store::claim_job(&db.pool, "w-2", 60)
+        .await
+        .expect("claim a cancelled row");
+    assert!(claim.is_none());
+
+    db.finish().await;
+}

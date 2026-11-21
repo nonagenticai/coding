@@ -450,6 +450,7 @@ pub async fn reap_expired(pool: &PgPool) -> Result<(u64, u64), AppError> {
         UPDATE jobs
         SET status = 'queued', lease_owner = NULL, lease_expires_at = NULL
         WHERE status = 'running' AND lease_expires_at < now() AND attempts < max_attempts
+          AND cancel_requested = false
         ",
     )
     .execute(pool)
@@ -465,6 +466,7 @@ pub async fn reap_expired(pool: &PgPool) -> Result<(u64, u64), AppError> {
                 'message', 'the worker stopped heartbeating and the attempt budget is spent',
                 'retryable', false)
         WHERE status = 'running' AND lease_expires_at < now() AND attempts >= max_attempts
+          AND cancel_requested = false
         ",
     )
     .execute(pool)
@@ -474,11 +476,13 @@ pub async fn reap_expired(pool: &PgPool) -> Result<(u64, u64), AppError> {
     Ok((requeued, failed))
 }
 
-/// Turn expired running jobs whose cancel was requested into terminal `cancelled` rows.
+/// Turn cancel-requested jobs that can no longer run into terminal `cancelled` rows.
 ///
 /// Run this BEFORE [`reap_expired`]. Otherwise the requeue would put such a job back to
 /// `queued`, and [`claim_job`] skips `cancel_requested` rows forever — the job would never be
-/// claimed and never reach a terminal state.
+/// claimed and never reach a terminal state. `reap_expired` now refuses to touch a
+/// cancel-requested row at all, but a row requeued by an older build can already be sitting in
+/// `queued` with the flag set; the `queued` arm heals those.
 ///
 /// # Errors
 ///
@@ -489,7 +493,8 @@ pub async fn reap_cancelled(pool: &PgPool) -> Result<u64, AppError> {
         UPDATE jobs
         SET status = 'cancelled', finished_at = now(),
             lease_owner = NULL, lease_expires_at = NULL
-        WHERE status = 'running' AND lease_expires_at < now() AND cancel_requested = true
+        WHERE cancel_requested = true
+          AND (status = 'queued' OR (status = 'running' AND lease_expires_at < now()))
         ",
     )
     .execute(pool)

@@ -29,6 +29,10 @@ pub enum AppError {
     /// "your tree is too big" from "your tree is malformed" without parsing the message.
     #[error("{0}")]
     PayloadTooLarge(String),
+    /// The request did not finish arriving inside the route's read budget. Distinct from
+    /// `PayloadTooLarge`: the archive may be well within the cap, the sender was too slow.
+    #[error("{0}")]
+    RequestTimeout(String),
     #[error("database error")]
     Database(#[from] sqlx::Error),
 }
@@ -42,12 +46,16 @@ impl AppError {
             Self::Conflict(_) => "conflict",
             Self::Unavailable(_) => "unavailable",
             Self::PayloadTooLarge(_) => "payload_too_large",
+            Self::RequestTimeout(_) => "request_timeout",
             Self::Database(_) => "internal",
         }
     }
 
     fn retryable(&self) -> bool {
-        matches!(self, Self::Unavailable(_) | Self::Database(_))
+        matches!(
+            self,
+            Self::Unavailable(_) | Self::RequestTimeout(_) | Self::Database(_)
+        )
     }
 }
 
@@ -60,6 +68,7 @@ impl IntoResponse for AppError {
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestTimeout(_) => StatusCode::REQUEST_TIMEOUT,
             Self::Database(e) => {
                 tracing::error!(error = %e, "database error");
                 StatusCode::INTERNAL_SERVER_ERROR

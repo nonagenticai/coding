@@ -69,6 +69,11 @@ capability are refused
 **before a Pod exists** when the pinned runner image predates them (`CODING_RUNNER_PROFILES`,
 `CODING_RUNNER_MULTI_SOURCE`).
 
+A Pod waiting on an image or config reason, or one the scheduler calls `Unschedulable`, is
+`Stuck`: retryable infrastructure reported before the job timeout, never a verdict about the
+code. The worker's clock starts at Pod creation and adds the `Pending` interval back (capped at
+120 s), because the runner's own clock starts when its container does.
+
 ## Store and tenancy
 
 PostgreSQL (`sqlx`, runtime queries only, migrations embedded from `migrations/`). The tenant is

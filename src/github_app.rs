@@ -139,14 +139,16 @@ impl GitHubApp {
     /// A `String` naming the failure when the app JWT cannot be signed, the token request
     /// fails or is refused, or the response is unreadable or carries an empty token.
     pub async fn installation_token(&self) -> Result<String, String> {
-        let mut cached = self.cached.lock().await;
-        if let Some((token, minted)) = cached.as_ref()
+        // The lock covers the cache, never the mint: holding it across `mint().await` lets one
+        // hung token request block every clone and delivery in the process. A concurrent pair of
+        // callers may mint twice; an installation token is not single-use, so that is harmless.
+        if let Some((token, minted)) = self.cached.lock().await.as_ref()
             && minted.elapsed() < TOKEN_TTL
         {
             return Ok(token.clone());
         }
         let token = self.mint().await?;
-        *cached = Some((token.clone(), Instant::now()));
+        *self.cached.lock().await = Some((token.clone(), Instant::now()));
         Ok(token)
     }
 
@@ -157,7 +159,14 @@ impl GitHubApp {
             "{}/app/installations/{}/access_tokens",
             self.api_base, self.installation_id
         );
-        let response = reqwest::Client::new()
+        // A mint that never returns would otherwise pin every caller behind it, so both the
+        // connect and the whole request are bounded.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .map_err(|err| format!("could not build the GitHub App client: {err}"))?;
+        let response = client
             .post(&url)
             .header("accept", "application/vnd.github+json")
             .header("x-github-api-version", "2022-11-28")
@@ -215,18 +224,26 @@ struct Minted {
     token: String,
 }
 
-/// Whether a clone URL names github.com. Only these receive an installation token: the token is
-/// a credential, and the request chooses the URL.
+/// Whether a clone URL names github.com over TLS. Only these receive an installation token: the
+/// token is a credential, and the request chooses the URL.
+///
+/// This parses the URL rather than looking for the string `github.com`, because a string search
+/// is how a credential leaks: `https://github.com:443@evil.example/r.git` starts with the right
+/// characters and sends every byte to `evil.example`. The parsed host must be exactly
+/// `github.com`, the scheme must be `https`, there must be no userinfo, and the port must be the
+/// default — a token is never attached to a URL that another host could receive.
 #[must_use]
 pub fn is_github_url(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-    else {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
         return false;
     };
-    let host = rest.split(['/', ':']).next().unwrap_or_default();
-    host.eq_ignore_ascii_case("github.com")
+    parsed.scheme() == "https"
+        && parsed
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && matches!(parsed.port(), None | Some(443))
 }
 
 /// The `AUTHORIZATION` header value a git client needs for an installation token.
@@ -363,6 +380,67 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
 
+    /// A token endpoint whose FIRST request hangs until released, and whose later requests
+    /// answer at once. Proves the mint lock is not held across the network call.
+    #[derive(Clone, Default)]
+    struct MintStub {
+        requests: std::sync::Arc<std::sync::Mutex<usize>>,
+        started: std::sync::Arc<tokio::sync::Notify>,
+        release: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    async fn mint_token(
+        axum::extract::State(stub): axum::extract::State<MintStub>,
+    ) -> axum::Json<serde_json::Value> {
+        let number = {
+            let mut requests = stub.requests.lock().expect("stub lock");
+            *requests += 1;
+            *requests
+        };
+        if number == 1 {
+            stub.started.notify_one();
+            stub.release.notified().await;
+        }
+        axum::Json(serde_json::json!({"token": format!("token-{number}")}))
+    }
+
+    #[tokio::test]
+    async fn a_hung_mint_does_not_block_a_second_caller() {
+        let stub = MintStub::default();
+        let app = axum::Router::new()
+            .route(
+                "/app/installations/{id}/access_tokens",
+                axum::routing::post(mint_token),
+            )
+            .with_state(stub.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let address = listener.local_addr().expect("stub address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let github = std::sync::Arc::new(GitHubApp::with_signer(
+            "1",
+            "2",
+            &format!("http://{address}"),
+            |_| Ok(vec![1u8; 256]),
+        ));
+
+        let first = {
+            let github = std::sync::Arc::clone(&github);
+            tokio::spawn(async move { github.installation_token().await })
+        };
+        stub.started.notified().await;
+        let second = tokio::time::timeout(Duration::from_secs(2), github.installation_token())
+            .await
+            .expect("a hung mint must not block another caller")
+            .expect("the second mint answers");
+        assert_eq!(second, "token-2");
+        stub.release.notify_one();
+        assert!(first.await.expect("join").is_ok());
+    }
+
     #[test]
     fn base64_round_trips_both_alphabets() {
         for (url, sample) in [
@@ -385,7 +463,7 @@ mod tests {
         for url in [
             "https://github.com/nonagenticai/coding.git",
             "https://github.com/nonagenticai/coding",
-            "http://github.com/o/r",
+            "https://github.com:443/o/r",
             "https://GitHub.com/o/r",
         ] {
             assert!(is_github_url(url), "{url}");
@@ -396,6 +474,16 @@ mod tests {
             "https://evil.example/github.com/o/r",
             "git://github.com/o/r",
             "https://gist.github.com/o/r",
+            // Cleartext: the token would travel unprotected.
+            "http://github.com/o/r",
+            // Userinfo is the host-confusion attack: the real host is after the `@`.
+            "https://github.com:443@evil.example/o/r",
+            "https://github.com@evil.example/o/r",
+            "https://user:pass@github.com/o/r",
+            // A non-default port is not the address GitHub serves the API from.
+            "https://github.com:8443/o/r",
+            // A trailing dot is a different host spelling; refusing it is the safe direction.
+            "https://github.com./o/r",
             "",
         ] {
             assert!(!is_github_url(url), "{url}");

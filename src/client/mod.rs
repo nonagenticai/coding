@@ -21,7 +21,7 @@ pub mod pack;
 
 use std::fmt;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -50,8 +50,12 @@ pub const EXIT_INFRA: u8 = 3;
 /// Ctrl-C.
 pub const EXIT_INTERRUPTED: u8 = 130;
 
-/// How often the client asks for the job's state.
+/// How often the client asks for the job's state once the fast window has passed.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Inside the fast window. A check that finishes in seconds should not wait two of them to be
+/// noticed; the window is short so a compile job still costs the app one poll per two seconds.
+const POLL_INTERVAL_FAST: Duration = Duration::from_millis(250);
+const POLL_FAST_WINDOW: Duration = Duration::from_secs(10);
 /// Per-request timeout. The upload gets its own, longer one.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -73,7 +77,10 @@ pub struct CheckArgs {
     /// The licence bearer token. `--token` or `CODING_TOKEN`, then `git config coding.token`.
     /// Never printed and never passed on a command line by the hooks.
     pub token: Option<String>,
-    pub kind: JobKind,
+    /// The gates to run against the one packed snapshot, in order. `--gates build,test` is the
+    /// pre-push gate: one pack, one upload, two jobs on the same source. An empty list is
+    /// resolved by the CLI to the single `--kind` (or `check`).
+    pub gates: Vec<JobKind>,
     /// `--profile`; `auto` (the default) detects the toolchain from the packed tree.
     pub profile: ProfileArg,
     /// Which snapshot to pack: the working tree (default), the index, or HEAD.
@@ -191,7 +198,7 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
     // 1. Upload the archive. The first request leaves a laptop moments after an `ssh -L` tunnel
     //    starts, and a tunnel is not ready the instant it prints — one attempt would report
     //    "cannot reach the app" for a tunnel that is fine a second later.
-    let upload = send_with_retry(|| {
+    let upload = send_with_retry(RetryPolicy::Writes, || {
         authorize(
             client
                 .post(format!("{base}/api/sources"))
@@ -211,7 +218,8 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
         .to_owned();
     println!("uploaded source {source_id}");
 
-    // 2. Ask for one check job.
+    // 2. Ask for one job per gate, all against the SAME uploaded source. The snapshot is packed
+    //    and uploaded once; a retried POST carries this gate's idempotency key.
     let mut input = json!({"source": {"kind": "upload", "id": source_id}});
     if profile != Profile::Rust {
         // Omitted for rust on purpose: rust is the server's default, and a runner image built
@@ -219,64 +227,136 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
         // it sent before profiles existed.
         input["profile"] = json!(profile.as_str());
     }
-    let request = json!({
-        "kind": args.kind.as_str(),
-        "input": input,
-        "timeout_seconds": args.timeout_seconds,
-    });
-    let created = send_with_retry(|| {
-        authorize(
-            client
-                .post(format!("{base}/api/jobs"))
-                .header("x-tenant-id", &tenant)
-                .json(&request),
+    let multiple = args.gates.len() > 1;
+    let mut jobs: Vec<Value> = Vec::with_capacity(args.gates.len());
+    let mut codes: Vec<u8> = Vec::with_capacity(args.gates.len());
+    let mut stopped_at: Option<usize> = None;
+    for (index, gate) in args.gates.iter().enumerate() {
+        if multiple {
+            println!("gate {}/{}: {}", index + 1, args.gates.len(), gate.as_str());
+        }
+        let request = json!({
+            "kind": gate.as_str(),
+            "input": input.clone(),
+            "timeout_seconds": args.timeout_seconds,
+            // A retried POST after a lost response must return THIS job, not create a second
+            // Pod; a fresh invocation must never be handed the previous run's finished job.
+            "idempotency_key": invocation_key(&sha256, *gate),
+        });
+        let created = send_with_retry(RetryPolicy::Writes, || {
+            authorize(
+                client
+                    .post(format!("{base}/api/jobs"))
+                    .header("x-tenant-id", &tenant)
+                    .json(&request),
+                token.as_deref(),
+            )
+        })
+        .await?;
+        let created = read_json(created).await?;
+        let job_id = created
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ClientError::Infra(format!("the job response has no id: {created}")))?
+            .to_owned();
+        println!("job {job_id} {}", created_status(&created));
+
+        let job = match poll_or_cancel(
+            &client,
+            &base,
+            &tenant,
+            &job_id,
+            args.timeout_seconds,
             token.as_deref(),
         )
-    })
-    .await?;
-    let created = read_json(created).await?;
-    let job_id = created
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ClientError::Infra(format!("the job response has no id: {created}")))?
-        .to_owned();
-    println!("job {job_id} {}", created_status(&created));
+        .await?
+        {
+            PollOutcome::Verdict(job) => job,
+            PollOutcome::Interrupted => return Ok(EXIT_INTERRUPTED),
+        };
+        let code = verdict_code(&job);
+        if !args.json {
+            print_verdict(&job);
+        }
+        jobs.push(job);
+        codes.push(code);
+        if code == EXIT_FAILED {
+            stopped_at = Some(index);
+            break;
+        }
+    }
 
-    // 3. Poll to a verdict, or cancel on Ctrl-C.
-    let poll = poll_to_verdict(
-        &client,
-        &base,
-        &tenant,
-        &job_id,
-        args.timeout_seconds,
-        token.as_deref(),
-    );
+    if args.json {
+        let document = if multiple {
+            Value::Array(jobs.clone())
+        } else {
+            jobs.first().cloned().unwrap_or(Value::Null)
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&document).unwrap_or_else(|_| document.to_string())
+        );
+    } else if let Some(index) = stopped_at {
+        for gate in &args.gates[index + 1..] {
+            println!(
+                "not run: {} gate (the {} gate failed)",
+                gate.as_str(),
+                args.gates[index].as_str()
+            );
+        }
+    }
+
+    // A failed check blocks; infrastructure and unsupported kinds still let a hook fail open, in
+    // that order of importance.
+    Ok(combined_exit(&codes))
+}
+
+/// The exit code after several gates: a failed check wins over everything, then infrastructure,
+/// then a kind this runner cannot execute. The gates after a failed one are not run.
+fn combined_exit(codes: &[u8]) -> u8 {
+    if codes.contains(&EXIT_FAILED) {
+        EXIT_FAILED
+    } else if codes.contains(&EXIT_INFRA) {
+        EXIT_INFRA
+    } else if codes.contains(&EXIT_USAGE) {
+        EXIT_USAGE
+    } else {
+        EXIT_OK
+    }
+}
+
+/// The outcome of polling one job.
+enum PollOutcome {
+    Verdict(Value),
+    Interrupted,
+}
+
+/// Poll one job to a verdict, or cancel it on Ctrl-C and tell the caller to stop.
+async fn poll_or_cancel(
+    client: &reqwest::Client,
+    base: &str,
+    tenant: &str,
+    job_id: &str,
+    timeout_seconds: u32,
+    token: Option<&str>,
+) -> Result<PollOutcome, ClientError> {
+    let poll = poll_to_verdict(client, base, tenant, job_id, timeout_seconds, token);
     tokio::pin!(poll);
-    let job = tokio::select! {
-        result = &mut poll => result?,
+    tokio::select! {
+        result = &mut poll => Ok(PollOutcome::Verdict(result?)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\ninterrupted: asking the app to cancel job {job_id}");
             let _ = authorize(
                 client
                     .post(format!("{base}/api/jobs/{job_id}/cancel"))
-                    .header("x-tenant-id", &tenant),
-                token.as_deref(),
+                    .header("x-tenant-id", tenant),
+                token,
             )
             .send()
             .await;
-            return Ok(EXIT_INTERRUPTED);
+            Ok(PollOutcome::Interrupted)
         }
-    };
-
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&job).unwrap_or_else(|_| job.to_string())
-        );
-        return Ok(verdict_code(&job));
     }
-    print_verdict(&job);
-    Ok(verdict_code(&job))
 }
 
 /// The URL to talk to, from the flag, the environment, or neither.
@@ -346,16 +426,39 @@ const TRANSPORT_ATTEMPTS: u32 = 3;
 /// The first wait between those attempts; each later wait doubles.
 const TRANSPORT_BACKOFF: Duration = Duration::from_millis(500);
 
+/// What a transport failure is allowed to mean for this request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetryPolicy {
+    /// A GET: the server changed nothing, so any failed attempt may be repeated.
+    Reads,
+    /// A POST: only a failure that happened BEFORE the connection was established is safe to
+    /// repeat. A timeout or a reset may arrive after the server stored the archive or created the
+    /// job, and a blind retry would upload twice or run two Pods; the client would then poll only
+    /// the id it happens to receive.
+    Writes,
+}
+
+impl RetryPolicy {
+    fn allows(self, error: &reqwest::Error) -> bool {
+        match self {
+            Self::Reads => true,
+            Self::Writes => error.is_connect(),
+        }
+    }
+}
+
 /// Send a request, retrying a **transport** failure a couple of times. A refusal or an error
-/// status is the app answering, and is never retried here.
+/// status is the app answering, and is never retried here. A write is retried only when the
+/// connection itself failed (`RetryPolicy::Writes`): see the enum for why.
 async fn send_with_retry(
+    policy: RetryPolicy,
     build: impl Fn() -> reqwest::RequestBuilder,
 ) -> Result<reqwest::Response, ClientError> {
     let mut attempt = 1;
     loop {
         match build().send().await {
             Ok(response) => return Ok(response),
-            Err(error) if attempt < TRANSPORT_ATTEMPTS => {
+            Err(error) if policy.allows(&error) && attempt < TRANSPORT_ATTEMPTS => {
                 let wait = TRANSPORT_BACKOFF * 2u32.pow(attempt - 1);
                 eprintln!(
                     "coding check: {error} — attempt {attempt}/{TRANSPORT_ATTEMPTS}, retrying in {}ms",
@@ -369,6 +472,22 @@ async fn send_with_retry(
             }
         }
     }
+}
+
+/// A job idempotency key that is stable across the retries of ONE invocation and different for
+/// every invocation.
+///
+/// It must not be derived from the tree alone: the pre-push hook runs the same snapshot twice a
+/// day, and a tree-derived key would hand the second run the first run's finished job. It must not
+/// be random per attempt either, or a retried POST would create a second job. Time + pid + the
+/// archive digest gives one key per process run, stable while that run retries.
+fn invocation_key(sha256: &str, kind: JobKind) -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    crate::source_archive::sha256_hex(
+        format!("{}:{sha256}:{nanos}:{}", kind.as_str(), std::process::id()).as_bytes(),
+    )
 }
 
 /// Read a response as JSON, mapping a refusal to the right exit class.
@@ -425,13 +544,14 @@ async fn poll_to_verdict(
         // the poll at once through read_json, because that is the app answering. The exception is
         // a bounded window of 5xx statuses that a rolling deployment produces (see
         // TRANSIENT_POLL_STATUSES): those are retried like a transport blip.
-        match authorize(
-            client
-                .get(format!("{base}/api/jobs/{job_id}"))
-                .header("x-tenant-id", tenant),
-            token,
-        )
-        .send()
+        match send_with_retry(RetryPolicy::Reads, || {
+            authorize(
+                client
+                    .get(format!("{base}/api/jobs/{job_id}"))
+                    .header("x-tenant-id", tenant),
+                token,
+            )
+        })
         .await
         {
             Ok(response) => {
@@ -483,7 +603,19 @@ async fn poll_to_verdict(
                 started.elapsed().as_secs()
             )));
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(poll_interval(started.elapsed(), transient_polls)).await;
+    }
+}
+
+/// The wait before the next poll.
+///
+/// A transient 5xx keeps the calm interval: `TRANSIENT_POLL_LIMIT` polls at 2 s is the ~12 s a
+/// rolling deployment needs, and the fast interval would spend that budget in 1.5 s.
+fn poll_interval(elapsed: Duration, transient_polls: u32) -> Duration {
+    if transient_polls == 0 && elapsed < POLL_FAST_WINDOW {
+        POLL_INTERVAL_FAST
+    } else {
+        POLL_INTERVAL
     }
 }
 
@@ -655,6 +787,23 @@ mod tests {
             skipped_secrets: Vec::new(),
             skipped_irregular: Vec::new(),
         }
+    }
+
+    #[test]
+    fn polling_is_fast_early_and_calm_afterwards() {
+        // A check that finishes in seconds must be noticed in a fraction of one, but a compile
+        // job must not cost the app a request every 250 ms for minutes.
+        assert_eq!(poll_interval(Duration::ZERO, 0), POLL_INTERVAL_FAST);
+        assert_eq!(poll_interval(Duration::from_secs(9), 0), POLL_INTERVAL_FAST);
+        assert_eq!(poll_interval(POLL_FAST_WINDOW, 0), POLL_INTERVAL);
+        // The transient-5xx window is `TRANSIENT_POLL_LIMIT` calm polls, whatever the clock says:
+        // a rolling deployment needs ~12 s, and fast polls would spend that budget in 1.5 s.
+        assert_eq!(poll_interval(Duration::from_secs(1), 1), POLL_INTERVAL);
+        assert_eq!(
+            u128::from(TRANSIENT_POLL_LIMIT) * POLL_INTERVAL.as_millis(),
+            12_000,
+            "the retry budget is the 12 s a rollout needs"
+        );
     }
 
     #[test]
@@ -836,6 +985,90 @@ mod tests {
                 .headers()
                 .get(reqwest::header::AUTHORIZATION)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_failed_gate_wins_over_infrastructure_and_usage() {
+        assert_eq!(combined_exit(&[EXIT_OK, EXIT_OK]), EXIT_OK);
+        assert_eq!(combined_exit(&[EXIT_OK, EXIT_FAILED]), EXIT_FAILED);
+        assert_eq!(combined_exit(&[EXIT_INFRA, EXIT_OK]), EXIT_INFRA);
+        assert_eq!(combined_exit(&[EXIT_USAGE, EXIT_OK]), EXIT_USAGE);
+        assert_eq!(
+            combined_exit(&[EXIT_USAGE, EXIT_INFRA]),
+            EXIT_INFRA,
+            "infrastructure is more serious than an unsupported kind"
+        );
+        assert_eq!(
+            combined_exit(&[EXIT_INFRA, EXIT_FAILED]),
+            EXIT_FAILED,
+            "a failed check blocks whatever else happened"
+        );
+    }
+
+    #[test]
+    fn an_invocation_key_is_unique_per_call_and_never_the_tree_alone() {
+        let first = invocation_key("abc", JobKind::Check);
+        let second = invocation_key("abc", JobKind::Check);
+        assert_ne!(
+            first, second,
+            "two runs on the same tree must not share a job"
+        );
+        assert_eq!(first.len(), 64, "sha256 hex");
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// A server that accepts connections and never answers, counting them.
+    async fn stalling_server() -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let address = listener.local_addr().expect("local addr");
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&accepts);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            loop {
+                let Ok((socket, _)) = listener.accept().await else {
+                    break;
+                };
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Keep the connection open so the client, not the peer, ends the attempt.
+                held.push(socket);
+            }
+        });
+        (format!("http://{address}/api/sources"), accepts)
+    }
+
+    #[tokio::test]
+    async fn a_write_is_not_retried_after_the_connection_was_made() {
+        let (url, accepts) = stalling_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let result = send_with_retry(RetryPolicy::Writes, || client.post(&url)).await;
+        assert!(result.is_err(), "a timed-out write is infrastructure");
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a write the server may already have applied must not be sent twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_is_retried_after_the_connection_was_made() {
+        let (url, accepts) = stalling_server().await;
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        let result = send_with_retry(RetryPolicy::Reads, || client.get(&url)).await;
+        assert!(result.is_err());
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            usize::try_from(TRANSPORT_ATTEMPTS).unwrap(),
+            "a read changes nothing and may be retried"
         );
     }
 }
