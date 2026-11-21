@@ -801,6 +801,73 @@ async fn state_reports_the_success_exit_code() {
 }
 
 #[tokio::test]
+async fn state_reports_a_pod_that_cannot_start_as_stuck() {
+    // A pinned image the registry cannot serve is not a slow pull to wait out: polling it for the
+    // whole job timeout would report a generic timeout and hide the real reason.
+    let pull = stub(StubInner {
+        pod: Some(json!({
+            "status": {
+                "phase": "Pending",
+                "containerStatuses": [{
+                    "state": {"waiting": {
+                        "reason": "ImagePullBackOff",
+                        "message": "manifest unknown"
+                    }}
+                }]
+            }
+        })),
+        ..Default::default()
+    });
+    let sandbox = sandbox_for(&pull).await;
+    assert_eq!(
+        sandbox.state("coding-run-job-1").await.expect("state"),
+        PodState::Stuck {
+            reason: "ImagePullBackOff: manifest unknown".to_owned()
+        }
+    );
+
+    let unschedulable = stub(StubInner {
+        pod: Some(json!({
+            "status": {
+                "phase": "Pending",
+                "conditions": [{
+                    "type": "PodScheduled",
+                    "status": "False",
+                    "reason": "Unschedulable",
+                    "message": "0/5 nodes are available"
+                }]
+            }
+        })),
+        ..Default::default()
+    });
+    let sandbox = sandbox_for(&unschedulable).await;
+    assert_eq!(
+        sandbox.state("coding-run-job-1").await.expect("state"),
+        PodState::Stuck {
+            reason: "Unschedulable: 0/5 nodes are available".to_owned()
+        }
+    );
+
+    // A container that is merely being created is a normal Pending, not a stuck Pod.
+    let creating = stub(StubInner {
+        pod: Some(json!({
+            "status": {
+                "phase": "Pending",
+                "containerStatuses": [{
+                    "state": {"waiting": {"reason": "ContainerCreating"}}
+                }]
+            }
+        })),
+        ..Default::default()
+    });
+    let sandbox = sandbox_for(&creating).await;
+    assert_eq!(
+        sandbox.state("coding-run-job-1").await.expect("state"),
+        PodState::Pending
+    );
+}
+
+#[tokio::test]
 async fn succeeded_without_a_result_line_is_a_runner_failure_not_a_pass() {
     // A Pod that exits 0 without the runner's verdict is not evidence about the code. The old
     // fallback invented `{"exit":"succeeded"}`, which a gate read as green.

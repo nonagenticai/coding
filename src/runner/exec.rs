@@ -31,6 +31,12 @@ pub const WORK_DIR: &str = "/tmp";
 pub const SOURCE_DIR: &str = "/tmp/src";
 /// The most stderr text carried into an error message.
 const MAX_ERROR_TEXT: usize = 2048;
+/// The most text read from a failing HTTP response. The status and a tail name the failure; the
+/// whole body is neither needed nor safe to buffer.
+const MAX_ERROR_BODY: usize = 4096;
+/// How long sccache's own server may take to answer `--show-stats` before the job stops caring.
+/// The stats are informational; a wedged server must never cost a passing job its result line.
+const SCCACHE_STATS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long the output pumps are given to finish after the child is gone. A grandchild can hold
 /// the pipe open; waiting on it forever would cost the job its result line.
 const PUMP_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -359,7 +365,24 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
             'attempt: loop {
                 attempt += 1;
                 if step.needs_database && database.available() {
-                    match database.ensure().await {
+                    let ensured = tokio::select! {
+                        result = database.ensure() => result,
+                        () = tokio::time::sleep_until(deadline) => {
+                            result.status = Status::Timeout;
+                            result.summary =
+                                format!("the throwaway Postgres did not start for {label}");
+                            return result;
+                        }
+                        _ = cancel.signal.recv() => {
+                            result.status = Status::Cancelled;
+                            result.summary = format!(
+                                "the job was cancelled while the throwaway Postgres was starting \
+                                 for {label}"
+                            );
+                            return result;
+                        }
+                    };
+                    match ensured {
                         Ok(url) => {
                             // Printed on purpose: the URL carries no secret (trust auth, a throwaway
                             // cluster), and when a test reports "Connection refused" the first
@@ -382,7 +405,24 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                     }
                 }
                 if step.needs_redis && redis.available() {
-                    match redis.ensure().await {
+                    let ensured = tokio::select! {
+                        result = redis.ensure() => result,
+                        () = tokio::time::sleep_until(deadline) => {
+                            result.status = Status::Timeout;
+                            result.summary =
+                                format!("the throwaway Redis did not start for {label}");
+                            return result;
+                        }
+                        _ = cancel.signal.recv() => {
+                            result.status = Status::Cancelled;
+                            result.summary = format!(
+                                "the job was cancelled while the throwaway Redis was starting \
+                                 for {label}"
+                            );
+                            return result;
+                        }
+                    };
+                    match ensured {
                         Ok(url) => {
                             // Probe the port the URL actually names: the CI exports a dind Redis on a
                             // random host port, and dialling 6379 would report a healthy server as
@@ -406,7 +446,24 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
                         }
                     }
                     let can_private = redis.can_start_private();
-                    match redis.ensure_private().await {
+                    let ensured = tokio::select! {
+                        result = redis.ensure_private() => result,
+                        () = tokio::time::sleep_until(deadline) => {
+                            result.status = Status::Timeout;
+                            result.summary =
+                                format!("the private Redis did not start for {label}");
+                            return result;
+                        }
+                        _ = cancel.signal.recv() => {
+                            result.status = Status::Cancelled;
+                            result.summary = format!(
+                                "the job was cancelled while the private Redis was starting \
+                                 for {label}"
+                            );
+                            return result;
+                        }
+                    };
+                    match ensured {
                         Ok(url) => {
                             println!("== redis: `{label}` gets TEST_REDIS_PRIVATE_URL={url}");
                             private_redis_url = Some(url);
@@ -629,7 +686,7 @@ pub async fn run_in(spec: &RunnerSpec, cancel: &mut Cancellation, work_dir: &Pat
 
     // Informational only: the verdict was decided by the checks above, and a cache that is
     // unreachable, unconfigured or absent leaves this `None` rather than changing the result.
-    if let Some(stats) = sccache_stats() {
+    if let Some(stats) = sccache_stats().await {
         println!(
             "sccache hits={} misses={} errors={}",
             stats.hits, stats.misses, stats.errors
@@ -1149,6 +1206,32 @@ async fn download(
     }
 }
 
+/// Read a failing response's body with the job's own deadline and cancel, bounded to a tail.
+///
+/// `response.text()` has neither: a proxy that stalls mid-body would hang past the deadline, and
+/// the runner would be `SIGKILL`ed before writing its result.
+async fn error_body(
+    response: &mut reqwest::Response,
+    deadline: TokioInstant,
+    cancel: &mut Cancellation,
+) -> String {
+    let mut body = Vec::new();
+    loop {
+        let next = tokio::select! {
+            chunk = response.chunk() => chunk.ok().flatten(),
+            () = tokio::time::sleep_until(deadline) => break,
+            _ = cancel.signal.recv() => break,
+        };
+        let Some(chunk) = next else { break };
+        let room = MAX_ERROR_BODY.saturating_sub(body.len());
+        if room == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..chunk.len().min(room)]);
+    }
+    tail(&String::from_utf8_lossy(&body))
+}
+
 /// A failed fetch, and whether trying again could help.
 struct FetchError {
     failure: Failure,
@@ -1183,10 +1266,11 @@ async fn fetch_once(
     let response =
         response.map_err(|err| setup(format!("could not fetch the uploaded source: {err}")))?;
 
+    let mut response = response;
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
-        let message = format!("the source download answered {status}: {}", tail(&body));
+        let body = error_body(&mut response, deadline, cancel).await;
+        let message = format!("the source download answered {status}: {body}");
         return Err(FetchError {
             failure: Failure {
                 stop: Stop::Exited(None),
@@ -1198,7 +1282,6 @@ async fn fetch_once(
     }
 
     let cap = crate::source_archive::MAX_COMPRESSED_BYTES;
-    let mut response = response;
     let mut blob = Vec::new();
     loop {
         let next = tokio::select! {
@@ -1343,15 +1426,19 @@ fn sccache_available() -> bool {
 /// What sccache reports for this job, when it is present and its output parses.
 ///
 /// Never an error: the cache cannot change a verdict, so every failure here is `None`.
-fn sccache_stats() -> Option<CacheStats> {
+async fn sccache_stats() -> Option<CacheStats> {
     if !sccache_available() {
         return None;
     }
-    let output = std::process::Command::new("sccache")
+    let mut command = Command::new("sccache");
+    command
         .args(["--show-stats", "--stats-format=json"])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output()
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(SCCACHE_STATS_TIMEOUT, command.output())
+        .await
+        .ok()?
         .ok()?;
     if !output.status.success() {
         return None;

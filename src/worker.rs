@@ -109,6 +109,15 @@ fn concurrency_from(raw: Option<&str>) -> usize {
 /// `concurrency`, four), so this is cheap; the interval is the delay between a Pod finishing and
 /// its verdict being recorded, which a developer waits through.
 const STATE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How much extra time a Pod may spend scheduling and pulling before its job deadline starts.
+/// The runner's own clock starts when its container does, not when the Pod is created, so a cold
+/// image pull would otherwise eat the job's budget and the worker would delete the Pod before the
+/// runner could write its structured timeout.
+const STARTUP_GRACE: Duration = Duration::from_secs(120);
+/// The runner times itself out this long before the worker's deadline, so it can still write its
+/// result line (its timeout path waits up to two 2 s pump graces first) and the worker can read
+/// it before deleting the Pod.
+const RUNNER_DEADLINE_MARGIN_SECONDS: i64 = 15;
 /// How many trailing log lines the executor asks the API for. The byte cap is enforced by
 /// [`Sandbox::logs`] regardless.
 const LOG_TAIL_LINES: u32 = 2000;
@@ -342,7 +351,10 @@ pub async fn execute_sandbox(
         "input": input,
         // The runner self-times-out just before the worker's own poll deadline, so its final
         // result line is still written and readable before the Pod is deleted.
-        "deadline_seconds": claim.timeout_seconds.saturating_sub(5).max(1),
+        "deadline_seconds": claim
+            .timeout_seconds
+            .saturating_sub(RUNNER_DEADLINE_MARGIN_SECONDS)
+            .max(1),
     });
 
     let pod = sandbox
@@ -365,6 +377,9 @@ pub async fn execute_sandbox(
 
 /// Poll a Pod to a terminal state. A state-read failure is logged and retried until the
 /// deadline: a transient API blip must not turn a running job into a failure.
+// reason: the loop is the job's state machine; the deadline extension and the terminal arms must
+// be read together.
+#[allow(clippy::too_many_lines)]
 async fn poll_pod(
     sandbox: &Sandbox,
     pool: &PgPool,
@@ -375,7 +390,10 @@ async fn poll_pod(
     // `max(0)` is non-negative, so the conversion cannot fail; a negative column would be a
     // database bug and is clamped rather than wrapping.
     let clamped = u64::try_from(timeout_seconds.max(0)).expect("clamped to non-negative");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(clamped);
+    let mut deadline = tokio::time::Instant::now() + Duration::from_secs(clamped);
+    // Set on the first Pending poll and consumed on the first Running one: the interval the Pod
+    // spent starting is added to the job's deadline, up to STARTUP_GRACE.
+    let mut pending_since: Option<tokio::time::Instant> = None;
     loop {
         // A cancel is checked on every tick, so the Pod dies within one interval rather than
         // running to its deadline. The caller sees `cancelled` and `execute_claim` records the
@@ -454,7 +472,31 @@ async fn poll_pod(
                     retryable: true,
                 });
             }
-            Ok(PodState::Pending | PodState::Running) => {}
+            Ok(PodState::Pending) => {
+                pending_since.get_or_insert_with(tokio::time::Instant::now);
+            }
+            Ok(PodState::Running) => {
+                if let Some(pending) = pending_since.take() {
+                    let extension = startup_extension(pending.elapsed());
+                    deadline += extension;
+                    tracing::info!(
+                        job_id = %claim.id,
+                        pod = %pod,
+                        extension_secs = extension.as_secs(),
+                        "sandbox: extended the job deadline for pod startup"
+                    );
+                }
+            }
+            Ok(PodState::Stuck { reason }) => {
+                return Err(JobError {
+                    code: "sandbox_error".to_owned(),
+                    message: format!("the runner pod cannot start: {reason}"),
+                    details: None,
+                    // A bad registry response or a scheduling delay is not a verdict about the
+                    // code; the caller may try again.
+                    retryable: true,
+                });
+            }
             Err(error) => {
                 tracing::warn!(pod = %pod, error = %error, "sandbox: pod state poll failed");
             }
@@ -471,6 +513,12 @@ async fn poll_pod(
         }
         tokio::time::sleep(STATE_POLL_INTERVAL.min(deadline - now)).await;
     }
+}
+
+/// How much of a Pod's Pending interval extends the job deadline. The cap keeps a Pod stuck in
+/// scheduling from extending the job forever.
+fn startup_extension(pending: Duration) -> Duration {
+    pending.min(STARTUP_GRACE)
 }
 
 /// Read the log once, at the end.
@@ -1075,6 +1123,20 @@ mod tests {
         assert!(
             input["sources"][2]["source"].get("token").is_none(),
             "a request-chosen host never receives the token"
+        );
+    }
+
+    #[test]
+    fn a_pod_start_extends_the_deadline_only_up_to_the_grace() {
+        assert_eq!(
+            startup_extension(Duration::from_millis(500)),
+            Duration::from_millis(500),
+            "the runner starts when its container does"
+        );
+        assert_eq!(
+            startup_extension(Duration::from_secs(3600)),
+            STARTUP_GRACE,
+            "a Pod stuck in scheduling cannot extend the job forever"
         );
     }
 }
