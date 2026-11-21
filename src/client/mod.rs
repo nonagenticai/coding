@@ -77,7 +77,10 @@ pub struct CheckArgs {
     /// The licence bearer token. `--token` or `CODING_TOKEN`, then `git config coding.token`.
     /// Never printed and never passed on a command line by the hooks.
     pub token: Option<String>,
-    pub kind: JobKind,
+    /// The gates to run against the one packed snapshot, in order. `--gates build,test` is the
+    /// pre-push gate: one pack, one upload, two jobs on the same source. An empty list is
+    /// resolved by the CLI to the single `--kind` (or `check`).
+    pub gates: Vec<JobKind>,
     /// `--profile`; `auto` (the default) detects the toolchain from the packed tree.
     pub profile: ProfileArg,
     /// Which snapshot to pack: the working tree (default), the index, or HEAD.
@@ -215,7 +218,8 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
         .to_owned();
     println!("uploaded source {source_id}");
 
-    // 2. Ask for one check job.
+    // 2. Ask for one job per gate, all against the SAME uploaded source. The snapshot is packed
+    //    and uploaded once; a retried POST carries this gate's idempotency key.
     let mut input = json!({"source": {"kind": "upload", "id": source_id}});
     if profile != Profile::Rust {
         // Omitted for rust on purpose: rust is the server's default, and a runner image built
@@ -223,67 +227,136 @@ async fn run_check(args: CheckArgs) -> Result<u8, ClientError> {
         // it sent before profiles existed.
         input["profile"] = json!(profile.as_str());
     }
-    let request = json!({
-        "kind": args.kind.as_str(),
-        "input": input,
-        "timeout_seconds": args.timeout_seconds,
-        // A retried POST after a lost response must return THIS invocation's job, not create a
-        // second Pod; a fresh invocation must never be handed the previous run's finished job.
-        "idempotency_key": invocation_key(&sha256, args.kind),
-    });
-    let created = send_with_retry(RetryPolicy::Writes, || {
-        authorize(
-            client
-                .post(format!("{base}/api/jobs"))
-                .header("x-tenant-id", &tenant)
-                .json(&request),
+    let multiple = args.gates.len() > 1;
+    let mut jobs: Vec<Value> = Vec::with_capacity(args.gates.len());
+    let mut codes: Vec<u8> = Vec::with_capacity(args.gates.len());
+    let mut stopped_at: Option<usize> = None;
+    for (index, gate) in args.gates.iter().enumerate() {
+        if multiple {
+            println!("gate {}/{}: {}", index + 1, args.gates.len(), gate.as_str());
+        }
+        let request = json!({
+            "kind": gate.as_str(),
+            "input": input.clone(),
+            "timeout_seconds": args.timeout_seconds,
+            // A retried POST after a lost response must return THIS job, not create a second
+            // Pod; a fresh invocation must never be handed the previous run's finished job.
+            "idempotency_key": invocation_key(&sha256, *gate),
+        });
+        let created = send_with_retry(RetryPolicy::Writes, || {
+            authorize(
+                client
+                    .post(format!("{base}/api/jobs"))
+                    .header("x-tenant-id", &tenant)
+                    .json(&request),
+                token.as_deref(),
+            )
+        })
+        .await?;
+        let created = read_json(created).await?;
+        let job_id = created
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ClientError::Infra(format!("the job response has no id: {created}")))?
+            .to_owned();
+        println!("job {job_id} {}", created_status(&created));
+
+        let job = match poll_or_cancel(
+            &client,
+            &base,
+            &tenant,
+            &job_id,
+            args.timeout_seconds,
             token.as_deref(),
         )
-    })
-    .await?;
-    let created = read_json(created).await?;
-    let job_id = created
-        .get("id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ClientError::Infra(format!("the job response has no id: {created}")))?
-        .to_owned();
-    println!("job {job_id} {}", created_status(&created));
+        .await?
+        {
+            PollOutcome::Verdict(job) => job,
+            PollOutcome::Interrupted => return Ok(EXIT_INTERRUPTED),
+        };
+        let code = verdict_code(&job);
+        if !args.json {
+            print_verdict(&job);
+        }
+        jobs.push(job);
+        codes.push(code);
+        if code == EXIT_FAILED {
+            stopped_at = Some(index);
+            break;
+        }
+    }
 
-    // 3. Poll to a verdict, or cancel on Ctrl-C.
-    let poll = poll_to_verdict(
-        &client,
-        &base,
-        &tenant,
-        &job_id,
-        args.timeout_seconds,
-        token.as_deref(),
-    );
+    if args.json {
+        let document = if multiple {
+            Value::Array(jobs.clone())
+        } else {
+            jobs.first().cloned().unwrap_or(Value::Null)
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&document).unwrap_or_else(|_| document.to_string())
+        );
+    } else if let Some(index) = stopped_at {
+        for gate in &args.gates[index + 1..] {
+            println!(
+                "not run: {} gate (the {} gate failed)",
+                gate.as_str(),
+                args.gates[index].as_str()
+            );
+        }
+    }
+
+    // A failed check blocks; infrastructure and unsupported kinds still let a hook fail open, in
+    // that order of importance.
+    Ok(combined_exit(&codes))
+}
+
+/// The exit code after several gates: a failed check wins over everything, then infrastructure,
+/// then a kind this runner cannot execute. The gates after a failed one are not run.
+fn combined_exit(codes: &[u8]) -> u8 {
+    if codes.contains(&EXIT_FAILED) {
+        EXIT_FAILED
+    } else if codes.contains(&EXIT_INFRA) {
+        EXIT_INFRA
+    } else if codes.contains(&EXIT_USAGE) {
+        EXIT_USAGE
+    } else {
+        EXIT_OK
+    }
+}
+
+/// The outcome of polling one job.
+enum PollOutcome {
+    Verdict(Value),
+    Interrupted,
+}
+
+/// Poll one job to a verdict, or cancel it on Ctrl-C and tell the caller to stop.
+async fn poll_or_cancel(
+    client: &reqwest::Client,
+    base: &str,
+    tenant: &str,
+    job_id: &str,
+    timeout_seconds: u32,
+    token: Option<&str>,
+) -> Result<PollOutcome, ClientError> {
+    let poll = poll_to_verdict(client, base, tenant, job_id, timeout_seconds, token);
     tokio::pin!(poll);
-    let job = tokio::select! {
-        result = &mut poll => result?,
+    tokio::select! {
+        result = &mut poll => Ok(PollOutcome::Verdict(result?)),
         _ = tokio::signal::ctrl_c() => {
             eprintln!("\ninterrupted: asking the app to cancel job {job_id}");
             let _ = authorize(
                 client
                     .post(format!("{base}/api/jobs/{job_id}/cancel"))
-                    .header("x-tenant-id", &tenant),
-                token.as_deref(),
+                    .header("x-tenant-id", tenant),
+                token,
             )
             .send()
             .await;
-            return Ok(EXIT_INTERRUPTED);
+            Ok(PollOutcome::Interrupted)
         }
-    };
-
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&job).unwrap_or_else(|_| job.to_string())
-        );
-        return Ok(verdict_code(&job));
     }
-    print_verdict(&job);
-    Ok(verdict_code(&job))
 }
 
 /// The URL to talk to, from the flag, the environment, or neither.
@@ -912,6 +985,24 @@ mod tests {
                 .headers()
                 .get(reqwest::header::AUTHORIZATION)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_failed_gate_wins_over_infrastructure_and_usage() {
+        assert_eq!(combined_exit(&[EXIT_OK, EXIT_OK]), EXIT_OK);
+        assert_eq!(combined_exit(&[EXIT_OK, EXIT_FAILED]), EXIT_FAILED);
+        assert_eq!(combined_exit(&[EXIT_INFRA, EXIT_OK]), EXIT_INFRA);
+        assert_eq!(combined_exit(&[EXIT_USAGE, EXIT_OK]), EXIT_USAGE);
+        assert_eq!(
+            combined_exit(&[EXIT_USAGE, EXIT_INFRA]),
+            EXIT_INFRA,
+            "infrastructure is more serious than an unsupported kind"
+        );
+        assert_eq!(
+            combined_exit(&[EXIT_INFRA, EXIT_FAILED]),
+            EXIT_FAILED,
+            "a failed check blocks whatever else happened"
         );
     }
 
