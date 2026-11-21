@@ -7,6 +7,7 @@
 //! it, the base ref must exist, and the archive's own caps bound the tree.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use reqwest::{Method, StatusCode};
 use serde_json::{Value, json};
@@ -101,10 +102,24 @@ pub async fn execute(
         retryable: false,
     })?;
     let api = app.api_base().trim_end_matches('/').to_owned();
-    let client = reqwest::Client::new();
+    // A stalled connection must not pin a worker slot forever: the heartbeat keeps renewing the
+    // lease while this future runs, so only these bounds (and the job's own timeout) end it.
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_secs(u64::try_from(claim.timeout_seconds).unwrap_or(0));
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|err| JobError {
+            code: "github_api_error".to_owned(),
+            message: format!("could not build the GitHub client: {err}"),
+            details: None,
+            retryable: true,
+        })?;
     let repo = output.repo.as_str();
 
     // Visible to the installation? A 404 here is about the repo, not the ref.
+    ensure_time(deadline)?;
     let visible = github(
         &client,
         &api,
@@ -130,6 +145,7 @@ pub async fn execute(
     }
 
     let base_path = format!("/repos/{repo}/git/ref/heads/{}", output.base);
+    ensure_time(deadline)?;
     let base_ref = github(&client, &api, &token, Method::GET, &base_path, None).await?;
     let base_sha = if base_ref.status.is_success() {
         base_ref.body["object"]["sha"]
@@ -182,6 +198,7 @@ pub async fn execute(
         }));
     }
     let tree = json!({"tree": entries});
+    ensure_time(deadline)?;
     let tree = github(
         &client,
         &api,
@@ -207,6 +224,7 @@ pub async fn execute(
         .trim()
         .to_owned();
     let commit = json!({"message": message, "tree": tree_sha, "parents": [base_sha]});
+    ensure_time(deadline)?;
     let commit = github(
         &client,
         &api,
@@ -230,6 +248,7 @@ pub async fn execute(
 
     // The branch: `<prefix>/<job id>`, deduped with a suffix if a retried job already made it.
     let mut branch = format!("{}/{}", output.branch_prefix, claim.id);
+    ensure_time(deadline)?;
     let mut attempt = 1;
     loop {
         let body = json!({"ref": format!("refs/heads/{branch}"), "sha": head_sha});
@@ -263,6 +282,7 @@ pub async fn execute(
         "head": branch,
         "base": output.base,
     });
+    ensure_time(deadline)?;
     let pr = github(
         &client,
         &api,
@@ -464,6 +484,19 @@ async fn github(
         serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()))
     };
     Ok(Github { status, body })
+}
+
+/// Refuse to start another step once the job's own timeout has passed.
+fn ensure_time(deadline: tokio::time::Instant) -> Result<(), JobError> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(JobError {
+            code: "timeout".to_owned(),
+            message: "the delivery did not finish within the job's timeout".to_owned(),
+            details: None,
+            retryable: true,
+        });
+    }
+    Ok(())
 }
 
 fn github_failed(status: StatusCode, body: &Value, path: &str) -> JobError {
