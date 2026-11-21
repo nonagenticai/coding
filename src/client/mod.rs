@@ -50,8 +50,12 @@ pub const EXIT_INFRA: u8 = 3;
 /// Ctrl-C.
 pub const EXIT_INTERRUPTED: u8 = 130;
 
-/// How often the client asks for the job's state.
+/// How often the client asks for the job's state once the fast window has passed.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// Inside the fast window. A check that finishes in seconds should not wait two of them to be
+/// noticed; the window is short so a compile job still costs the app one poll per two seconds.
+const POLL_INTERVAL_FAST: Duration = Duration::from_millis(250);
+const POLL_FAST_WINDOW: Duration = Duration::from_secs(10);
 /// Per-request timeout. The upload gets its own, longer one.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
@@ -483,7 +487,19 @@ async fn poll_to_verdict(
                 started.elapsed().as_secs()
             )));
         }
-        tokio::time::sleep(POLL_INTERVAL).await;
+        tokio::time::sleep(poll_interval(started.elapsed(), transient_polls)).await;
+    }
+}
+
+/// The wait before the next poll.
+///
+/// A transient 5xx keeps the calm interval: `TRANSIENT_POLL_LIMIT` polls at 2 s is the ~12 s a
+/// rolling deployment needs, and the fast interval would spend that budget in 1.5 s.
+fn poll_interval(elapsed: Duration, transient_polls: u32) -> Duration {
+    if transient_polls == 0 && elapsed < POLL_FAST_WINDOW {
+        POLL_INTERVAL_FAST
+    } else {
+        POLL_INTERVAL
     }
 }
 
@@ -655,6 +671,23 @@ mod tests {
             skipped_secrets: Vec::new(),
             skipped_irregular: Vec::new(),
         }
+    }
+
+    #[test]
+    fn polling_is_fast_early_and_calm_afterwards() {
+        // A check that finishes in seconds must be noticed in a fraction of one, but a compile
+        // job must not cost the app a request every 250 ms for minutes.
+        assert_eq!(poll_interval(Duration::ZERO, 0), POLL_INTERVAL_FAST);
+        assert_eq!(poll_interval(Duration::from_secs(9), 0), POLL_INTERVAL_FAST);
+        assert_eq!(poll_interval(POLL_FAST_WINDOW, 0), POLL_INTERVAL);
+        // The transient-5xx window is `TRANSIENT_POLL_LIMIT` calm polls, whatever the clock says:
+        // a rolling deployment needs ~12 s, and fast polls would spend that budget in 1.5 s.
+        assert_eq!(poll_interval(Duration::from_secs(1), 1), POLL_INTERVAL);
+        assert_eq!(
+            u128::from(TRANSIENT_POLL_LIMIT) * POLL_INTERVAL.as_millis(),
+            12_000,
+            "the retry budget is the 12 s a rollout needs"
+        );
     }
 
     #[test]

@@ -192,7 +192,7 @@ fn run_child(phase: &str, repo: &Path) -> Cost {
     }
     let out = child.wait_with_output().expect("phase output");
     assert!(out.status.success(), "phase {phase} failed");
-    let text = String::from_utf8_lossy(&out.stdout).to_owned();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
     let field = |key: &str| -> u128 {
         text.split_whitespace()
             .find_map(|word| word.strip_prefix(key)?.parse().ok())

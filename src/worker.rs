@@ -105,8 +105,10 @@ fn concurrency_from(raw: Option<&str>) -> usize {
 }
 
 /// How often the executor polls a running Pod. Nothing streams: the log is read once, after
-/// the Pod reaches a terminal state.
-const STATE_POLL_INTERVAL: Duration = Duration::from_secs(2);
+/// the Pod reaches a terminal state. Every poll is one Get per running Pod (at most
+/// `concurrency`, four), so this is cheap; the interval is the delay between a Pod finishing and
+/// its verdict being recorded, which a developer waits through.
+const STATE_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// How many trailing log lines the executor asks the API for. The byte cap is enforced by
 /// [`Sandbox::logs`] regardless.
 const LOG_TAIL_LINES: u32 = 2000;
