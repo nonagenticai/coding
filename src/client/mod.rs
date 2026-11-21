@@ -471,13 +471,14 @@ async fn poll_to_verdict(
         // the poll at once through read_json, because that is the app answering. The exception is
         // a bounded window of 5xx statuses that a rolling deployment produces (see
         // TRANSIENT_POLL_STATUSES): those are retried like a transport blip.
-        match authorize(
-            client
-                .get(format!("{base}/api/jobs/{job_id}"))
-                .header("x-tenant-id", tenant),
-            token,
-        )
-        .send()
+        match send_with_retry(RetryPolicy::Reads, || {
+            authorize(
+                client
+                    .get(format!("{base}/api/jobs/{job_id}"))
+                    .header("x-tenant-id", tenant),
+                token,
+            )
+        })
         .await
         {
             Ok(response) => {
