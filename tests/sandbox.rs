@@ -43,6 +43,8 @@ struct StubInner {
     /// The Pods `GET .../pods` lists, for the reaper.
     pods: Vec<Value>,
     log: String,
+    /// Status the log endpoint answers; `0` means `200 OK` with `log`.
+    log_status: u16,
     deletes: Vec<String>,
     /// Every Pod manifest the client created, in order — what the worker actually sent.
     created: Vec<Value>,
@@ -114,6 +116,11 @@ async fn get_log(
     Path((_namespace, _name)): Path<(String, String)>,
 ) -> Response {
     let inner = stub.inner.lock().expect("stub lock");
+    if inner.log_status != 0 {
+        let status =
+            StatusCode::from_u16(inner.log_status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return (status, "log unavailable").into_response();
+    }
     (StatusCode::OK, inner.log.clone()).into_response()
 }
 
@@ -817,6 +824,26 @@ async fn succeeded_without_a_result_line_is_a_runner_failure_not_a_pass() {
     assert_eq!(error.code, "runner_failed");
     assert!(!error.retryable);
     assert_eq!(error.details, Some(json!("build ok\n")));
+}
+
+#[tokio::test]
+async fn a_log_read_failure_after_success_is_infrastructure_not_a_runner_failure() {
+    // The Pod exited 0, but without its log the verdict line cannot be read. The old path
+    // degraded the read to "", which then looked exactly like a runner that wrote no verdict:
+    // a non-retryable `runner_failed`. The class matters — a hook fails open on infrastructure
+    // and blocks on a runner failure.
+    let stub = stub(StubInner {
+        pod: Some(json!({ "status": { "phase": "Succeeded" } })),
+        log_status: 500,
+        ..Default::default()
+    });
+    let sandbox = sandbox_for(&stub).await;
+
+    let error = run_job(&sandbox, claim("job-1", JobKind::Test, 30))
+        .await
+        .expect_err("a verdict that cannot be read is not a verdict");
+    assert_eq!(error.code, "log_unavailable");
+    assert!(error.retryable, "the log read is infrastructure");
 }
 
 #[tokio::test]

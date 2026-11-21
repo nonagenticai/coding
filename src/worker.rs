@@ -401,7 +401,22 @@ async fn poll_pod(
         }
         match sandbox.state(pod).await {
             Ok(PodState::Succeeded { exit_code }) => {
-                let log = read_log(sandbox, pod).await;
+                let log = match read_log(sandbox, pod).await {
+                    Ok(log) => log,
+                    Err(error) => {
+                        // The Pod says it succeeded, but without its log the verdict line cannot
+                        // be verified. That is the log read failing, not a verdict about the
+                        // code: classify it as infrastructure, never as `runner_failed`.
+                        return Err(JobError {
+                            code: "log_unavailable".to_owned(),
+                            message: format!(
+                                "the runner pod succeeded but its log could not be read: {error}"
+                            ),
+                            details: None,
+                            retryable: true,
+                        });
+                    }
+                };
                 tracing::info!(
                     pod = %pod,
                     exit_code = ?exit_code,
@@ -422,7 +437,7 @@ async fn poll_pod(
                 };
             }
             Ok(PodState::Failed { reason }) => {
-                let log = read_log(sandbox, pod).await;
+                let log = read_log(sandbox, pod).await.unwrap_or_default();
                 return Err(JobError {
                     code: "runner_failed".to_owned(),
                     message: reason,
@@ -458,16 +473,16 @@ async fn poll_pod(
     }
 }
 
-/// Read the log once, at the end. A log failure must never turn a finished job into a retry
-/// loop, so it degrades to an empty tail.
-async fn read_log(sandbox: &Sandbox, pod: &str) -> String {
-    match sandbox.logs(pod, LOG_TAIL_LINES).await {
-        Ok(log) => log,
-        Err(error) => {
-            tracing::warn!(pod = %pod, error = %error, "sandbox: log read failed");
-            String::new()
-        }
-    }
+/// Read the log once, at the end.
+///
+/// A read failure never turns a *failed* Pod into a different verdict: the Pod already decided
+/// that, and the tail is only the explanation. On the success path the log IS the verdict, so the
+/// caller must classify a read failure as infrastructure rather than inventing `runner_failed`.
+async fn read_log(sandbox: &Sandbox, pod: &str) -> Result<String, String> {
+    sandbox
+        .logs(pod, LOG_TAIL_LINES)
+        .await
+        .map_err(|error| error.to_string())
 }
 
 /// The job result: the runner's `{"coding_result": …}` line, wherever it sits in the log.
@@ -765,15 +780,32 @@ async fn execute_claim(
     // The guard aborts the renewal on **every** exit from this scope: normal return, `?`, a
     // panic unwind, or a JoinSet abort of this future. A detached heartbeat would keep a dead
     // slot's lease alive forever, so the reaper could never reclaim the job.
+    //
+    // The heartbeat also owns the other direction: when the claim is lost, it signals here, and
+    // the executor is dropped instead of being allowed to duplicate work the new owner has
+    // already started.
+    let (lease_lost, lease_lost_rx) = tokio::sync::oneshot::channel();
     let _heartbeat = AbortOnDrop::new(tokio::spawn(heartbeat_loop(
         pool.clone(),
         owner.clone(),
         claim.id.clone(),
         settings.lease_seconds,
         settings.heartbeat_interval,
+        lease_lost,
     )));
+    let mut lease_lost = lease_lost_rx;
 
-    let outcome = executor(claim.clone()).await;
+    let outcome = tokio::select! {
+        biased;
+        _ = &mut lease_lost => {
+            tracing::warn!(
+                job_id = %claim.id,
+                "lease lost while the job ran; abandoning it rather than duplicating work"
+            );
+            return Ok(());
+        }
+        outcome = executor(claim.clone()) => outcome,
+    };
 
     // Re-check before recording an outcome: a cancel that arrived while the job ran wins, and
     // the executor's result is discarded rather than recorded as success.
@@ -817,25 +849,47 @@ impl Drop for AbortOnDrop {
 }
 
 /// Renew the lease until the job is finished or this claim is no longer the owner.
+///
+/// The claim is lost in two ways: the renewal says another owner has the row (`Ok(false)`), or no
+/// renewal has succeeded for one lease interval while the database is unreachable. In both cases
+/// the executor must stop — a reaper elsewhere may already have requeued the job, and two workers
+/// doing the same work is worse than a job that has to be retried.
 async fn heartbeat_loop(
     pool: PgPool,
     owner: LeaseOwner,
     job_id: String,
     lease_seconds: i64,
     interval: Duration,
+    lost: tokio::sync::oneshot::Sender<()>,
 ) {
+    // Stop just before the row's `lease_expires_at`, not at it: the reaper claims a lease the
+    // instant it expires, so waiting until then guarantees a window with two owners.
+    let lease_budget =
+        Duration::from_secs(u64::try_from(lease_seconds).unwrap_or(0)).saturating_sub(interval);
+    let mut last_ok = tokio::time::Instant::now();
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     ticker.tick().await; // the first tick is immediate
     loop {
         ticker.tick().await;
         match store::heartbeat(&pool, &owner, &job_id, lease_seconds).await {
-            Ok(true) => {}
+            Ok(true) => last_ok = tokio::time::Instant::now(),
             Ok(false) => {
                 tracing::warn!(job_id = %job_id, "lease lost; stop heartbeating");
+                let _ = lost.send(());
                 return;
             }
-            Err(error) => tracing::warn!(job_id = %job_id, error = %error, "heartbeat failed"),
+            Err(error) => {
+                tracing::warn!(job_id = %job_id, error = %error, "heartbeat failed");
+                if last_ok.elapsed() >= lease_budget {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        "no lease renewal succeeded for {lease_budget:?}; abandoning the claim"
+                    );
+                    let _ = lost.send(());
+                    return;
+                }
+            }
         }
     }
 }
